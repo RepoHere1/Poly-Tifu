@@ -1,14 +1,15 @@
 """
-Client Module - API Clients for Polymarket
+Client Module - API Clients for Polymarket (CLOB V2)
 
 Provides clients for interacting with:
-- CLOB (Central Limit Order Book) API
-- Builder Relayer API
+- CLOB (Central Limit Order Book) API (V2)
+- Builder Relayer API (gasless, HMAC-authenticated)
 
-Features:
-- Gasless transactions via Builder Program
-- HMAC authentication for Builder APIs
-- Automatic retry and error handling
+CLOB V2 notes:
+- Order attribution uses the `builder` (bytes32) field signed into each
+  order. The legacy `POLY_BUILDER_*` HMAC headers are gone for CLOB.
+- L1/L2 API auth headers are unchanged.
+- The Relayer still uses the builder HMAC credentials for gasless tx.
 
 Example:
     from src.client import ClobClient, RelayerClient
@@ -17,13 +18,13 @@ Example:
         host="https://clob.polymarket.com",
         chain_id=137,
         signature_type=2,
-        funder="0x..."
+        funder="0x...",
     )
 
     relayer = RelayerClient(
         host="https://relayer-v2.polymarket.com",
         chain_id=137,
-        builder_creds=builder_creds
+        builder_creds=builder_creds,
     )
 """
 
@@ -227,9 +228,11 @@ class ClobClient(ApiClient):
         body: str = ""
     ) -> Dict[str, str]:
         """
-        Build authentication headers.
+        Build L2 authentication headers for the CLOB V2 API.
 
-        Supports both user API credentials and Builder credentials.
+        V2 removes the `POLY_BUILDER_*` HMAC headers — builder
+        attribution is carried in the signed `builder` field on the
+        order itself.
 
         Args:
             method: HTTP method
@@ -239,27 +242,9 @@ class ClobClient(ApiClient):
         Returns:
             Dictionary of headers
         """
-        headers = {}
+        headers: Dict[str, str] = {}
 
-        # Builder HMAC authentication
-        if self.builder_creds and self.builder_creds.is_configured():
-            timestamp = str(int(time.time()))
-
-            message = f"{timestamp}{method}{path}{body}"
-            signature = hmac.new(
-                self.builder_creds.api_secret.encode(),
-                message.encode(),
-                hashlib.sha256
-            ).hexdigest()
-
-            headers.update({
-                "POLY_BUILDER_API_KEY": self.builder_creds.api_key,
-                "POLY_BUILDER_TIMESTAMP": timestamp,
-                "POLY_BUILDER_PASSPHRASE": self.builder_creds.api_passphrase,
-                "POLY_BUILDER_SIGNATURE": signature,
-            })
-
-        # User API credentials (L2 authentication)
+        # User API credentials (L2 authentication) — unchanged in V2
         if self.api_creds and self.api_creds.is_valid():
             timestamp = str(int(time.time()))
 
@@ -412,6 +397,22 @@ class ClobClient(ApiClient):
             params={"token_id": token_id}
         )
 
+    def get_clob_market_info(self, condition_id: str) -> Dict[str, Any]:
+        """
+        Fetch V2 CLOB market parameters (tick size, min size, fees, tokens).
+
+        Args:
+            condition_id: Market condition ID
+
+        Returns:
+            Dict with keys: mts, mos, fd, t, rfqe
+        """
+        return self._request(
+            "GET",
+            "/clob-market-info",
+            params={"condition_id": condition_id},
+        )
+
     def get_open_orders(self) -> List[Dict[str, Any]]:
         """
         Get all open orders for the funder.
@@ -487,10 +488,13 @@ class ClobClient(ApiClient):
         order_type: str = "GTC"
     ) -> Dict[str, Any]:
         """
-        Submit a signed order.
+        Submit a signed order to the V2 CLOB.
+
+        The V2 order body nests the signature inside the `order`
+        object and uses the L2 api-key as `owner`.
 
         Args:
-            signed_order: Order with signature
+            signed_order: Order with signature (output of OrderSigner.sign_order)
             order_type: Order type (GTC, GTD, FOK)
 
         Returns:
@@ -498,16 +502,19 @@ class ClobClient(ApiClient):
         """
         endpoint = "/order"
 
-        # Build request body
+        order_body = signed_order.get("order", signed_order)
+
+        # Ensure signature is present inside the order object (V2 wire format)
+        if "signature" not in order_body and "signature" in signed_order:
+            order_body = {**order_body, "signature": signed_order["signature"]}
+
+        owner = self.api_creds.api_key if self.api_creds and self.api_creds.is_valid() else self.funder
+
         body = {
-            "order": signed_order.get("order", signed_order),
-            "owner": self.funder,
+            "order": order_body,
+            "owner": owner,
             "orderType": order_type,
         }
-
-        # Add signature
-        if "signature" in signed_order:
-            body["signature"] = signed_order["signature"]
 
         body_json = json.dumps(body, separators=(',', ':'))
         headers = self._build_headers("POST", endpoint, body_json)

@@ -8,20 +8,27 @@ safe_address: "0x0000000000000000000000000000000000000000"
 # RPC URL for Polygon
 rpc_url: "https://polygon-rpc.com"
 
-# CLOB Configuration
+# CLOB Configuration (V2)
+# After the April 28, 2026 cutover, V2 serves on the canonical URL below.
+# Use "https://clob-v2.polymarket.com" to test against V2 before cutover.
 clob:
   host: "https://clob.polymarket.com"
   chain_id: 137
   signature_type: 2  # Gnosis Safe
+  neg_risk: false    # Set true for Neg Risk markets
 
 # Relayer Configuration (for gasless transactions)
 relayer:
   host: "https://relayer-v2.polymarket.com"
   tx_type: "SAFE"
 
-# Builder Program Credentials (for gasless trading)
-# Apply at: polymarket.com/settings?tab=builder
+# Builder Program
+# - builder_code (bytes32 hex) attributes orders to your builder account (CLOB V2)
+# - api_key / api_secret / api_passphrase authenticate against the Relayer
+#   for gasless operations
+# Copy your code from polymarket.com/settings?tab=builder
 builder:
+  builder_code: ""
   api_key: ""
   api_secret: ""
   api_passphrase: ""

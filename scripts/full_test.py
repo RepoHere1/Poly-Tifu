@@ -295,7 +295,7 @@ def test_client_module(creds: dict) -> bool:
     print_header("5. Testing Client Module (client.py)")
 
     try:
-        from src.client import ClobClient
+        from src.client import ClobClient, RelayerClient
         from src.config import BuilderConfig
 
         builder_config = BuilderConfig(
@@ -304,34 +304,38 @@ def test_client_module(creds: dict) -> bool:
             api_passphrase=creds["builder_passphrase"],
         ) if creds["builder_key"] else None
 
-        # Create CLOB client
+        # Create CLOB client (V2 — builder attribution is via signed order, not headers)
         clob = ClobClient(
             host="https://clob.polymarket.com",
             chain_id=137,
             funder=creds["safe_address"],
-            builder_creds=builder_config
         )
 
         print_success(f"CLOB Client created")
         print_info(f"Host: {clob.host}")
         print_info(f"Chain ID: {clob.chain_id}")
 
-        # Test HMAC header generation
+        # Relayer still uses HMAC auth for gasless
         if builder_config and builder_config.is_configured():
-            headers = clob._build_headers("GET", "/orders")
+            relayer = RelayerClient(
+                host="https://relayer-v2.polymarket.com",
+                chain_id=137,
+                builder_creds=builder_config,
+            )
+            headers = relayer._build_headers("POST", "/deploy", "{}")
             expected_keys = [
                 "POLY_BUILDER_API_KEY",
                 "POLY_BUILDER_TIMESTAMP",
                 "POLY_BUILDER_PASSPHRASE",
-                "POLY_BUILDER_SIGNATURE"
+                "POLY_BUILDER_SIGNATURE",
             ]
             if all(k in headers for k in expected_keys):
-                print_success(f"HMAC headers generated: {list(headers.keys())}")
+                print_success(f"Relayer HMAC headers generated: {list(headers.keys())}")
             else:
-                print_error("Missing HMAC headers")
+                print_error("Missing Relayer HMAC headers")
                 return False
         else:
-            print_warning("Builder not configured, skipping HMAC test")
+            print_warning("Builder HMAC creds not configured, skipping relayer auth test")
 
         return True
 

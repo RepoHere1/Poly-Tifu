@@ -13,9 +13,10 @@ Environment Variables:
     POLY_PRIVATE_KEY: Private key (hex string, with or without 0x prefix)
     POLY_SAFE_ADDRESS: Polymarket Safe/Proxy wallet address
     POLY_RPC_URL: Polygon RPC URL
-    POLY_BUILDER_API_KEY: Builder Program API key
-    POLY_BUILDER_API_SECRET: Builder Program API secret
-    POLY_BUILDER_API_PASSPHRASE: Builder Program passphrase
+    POLY_BUILDER_API_KEY: Builder Program API key (Relayer / gasless)
+    POLY_BUILDER_API_SECRET: Builder Program API secret (Relayer / gasless)
+    POLY_BUILDER_API_PASSPHRASE: Builder Program passphrase (Relayer / gasless)
+    POLY_BUILDER_CODE: V2 builder code (bytes32 hex) for order attribution
     POLY_CLOB_HOST: CLOB API host
     POLY_CHAIN_ID: Chain ID (default: 137)
     POLY_DATA_DIR: Data directory for credentials
@@ -90,16 +91,40 @@ class ConfigNotFoundError(ConfigError):
     pass
 
 
+ZERO_BUILDER_CODE = "0x" + "00" * 32
+
+
 @dataclass
 class BuilderConfig:
-    """Builder Program configuration for gasless transactions."""
+    """
+    Builder Program configuration.
+
+    In CLOB V2, order attribution uses the `builder_code` (a bytes32
+    hex string) attached to each signed order. The HMAC credentials
+    (api_key / api_secret / api_passphrase) remain in use for the
+    Relayer API (gasless transactions).
+    """
     api_key: str = ""
     api_secret: str = ""
     api_passphrase: str = ""
+    builder_code: str = ""
 
     def is_configured(self) -> bool:
-        """Check if Builder credentials are configured."""
+        """Check if Relayer (HMAC) Builder credentials are configured."""
         return bool(self.api_key and self.api_secret and self.api_passphrase)
+
+    def has_builder_code(self) -> bool:
+        """Check if a builder code is configured for order attribution."""
+        code = self.builder_code
+        if not code:
+            return False
+        normalized = code.lower()
+        return normalized not in (ZERO_BUILDER_CODE, "0x")
+
+    @property
+    def order_builder_code(self) -> str:
+        """Return the builder code to stamp on orders (defaults to zero)."""
+        return self.builder_code if self.has_builder_code() else ZERO_BUILDER_CODE
 
 
 @dataclass
@@ -108,6 +133,7 @@ class ClobConfig:
     host: str = "https://clob.polymarket.com"
     chain_id: int = 137
     signature_type: int = 2  # Gnosis Safe
+    neg_risk: bool = False  # True for Neg Risk markets
 
     def is_valid(self) -> bool:
         """Validate CLOB configuration."""
@@ -211,6 +237,7 @@ class Config:
                 host=clob_data.get("host", config.clob.host),
                 chain_id=clob_data.get("chain_id", config.clob.chain_id),
                 signature_type=clob_data.get("signature_type", config.clob.signature_type),
+                neg_risk=clob_data.get("neg_risk", config.clob.neg_risk),
             )
 
         # Relayer config
@@ -228,6 +255,7 @@ class Config:
                 api_key=builder_data.get("api_key", ""),
                 api_secret=builder_data.get("api_secret", ""),
                 api_passphrase=builder_data.get("api_passphrase", ""),
+                builder_code=builder_data.get("builder_code", ""),
             )
 
         # Trading defaults
@@ -286,11 +314,13 @@ class Config:
         api_key = get_env("BUILDER_API_KEY")
         api_secret = get_env("BUILDER_API_SECRET")
         api_passphrase = get_env("BUILDER_API_PASSPHRASE")
-        if api_key or api_secret or api_passphrase:
+        builder_code = get_env("BUILDER_CODE")
+        if api_key or api_secret or api_passphrase or builder_code:
             config.builder = BuilderConfig(
                 api_key=api_key,
                 api_secret=api_secret,
                 api_passphrase=api_passphrase,
+                builder_code=builder_code,
             )
 
         # CLOB config
@@ -357,12 +387,15 @@ class Config:
         api_key = get_env("BUILDER_API_KEY")
         api_secret = get_env("BUILDER_API_SECRET")
         api_passphrase = get_env("BUILDER_API_PASSPHRASE")
+        builder_code = get_env("BUILDER_CODE")
         if api_key:
             config.builder.api_key = api_key
         if api_secret:
             config.builder.api_secret = api_secret
         if api_passphrase:
             config.builder.api_passphrase = api_passphrase
+        if builder_code:
+            config.builder.builder_code = builder_code
 
         # Other settings
         data_dir = get_env("DATA_DIR")

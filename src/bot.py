@@ -292,10 +292,11 @@ class TradingBot:
         size: float,
         side: str,
         order_type: str = "GTC",
-        fee_rate_bps: int = 0
+        neg_risk: Optional[bool] = None,
+        builder_code: Optional[str] = None,
     ) -> OrderResult:
         """
-        Place a limit order.
+        Place a limit order via CLOB V2.
 
         Args:
             token_id: Market token ID
@@ -303,7 +304,10 @@ class TradingBot:
             size: Number of shares
             side: 'BUY' or 'SELL'
             order_type: Order type (GTC, GTD, FOK)
-            fee_rate_bps: Fee rate in basis points
+            neg_risk: Override whether the market uses the Neg Risk exchange
+                (defaults to the clob config).
+            builder_code: Override builder code (bytes32 hex) for this order.
+                Defaults to the builder code on the bot config.
 
         Returns:
             OrderResult with order status
@@ -311,20 +315,27 @@ class TradingBot:
         signer = self.require_signer()
 
         try:
-            # Create order
+            effective_neg_risk = (
+                self.config.clob.neg_risk if neg_risk is None else neg_risk
+            )
+            effective_builder_code = (
+                builder_code if builder_code is not None
+                else self.config.builder.order_builder_code
+            )
+
             order = Order(
                 token_id=token_id,
                 price=price,
                 size=size,
                 side=side,
                 maker=self.config.safe_address,
-                fee_rate_bps=fee_rate_bps,
+                signature_type=self.config.clob.signature_type,
+                neg_risk=effective_neg_risk,
+                builder_code=effective_builder_code,
             )
 
-            # Sign order
             signed = signer.sign_order(order)
 
-            # Submit to CLOB
             response = await self._run_in_thread(
                 self.clob_client.post_order,
                 signed,

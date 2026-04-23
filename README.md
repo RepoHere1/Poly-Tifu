@@ -4,16 +4,19 @@ English | [简体中文](README_CN.md)
 
 A beginner-friendly Python trading bot for Polymarket with gasless transactions and real-time WebSocket data.
 
+> **CLOB V2 ready.** Signs orders against the V2 exchange domain (`Polymarket CTF Exchange`, version `2`) with the new `timestamp` / `metadata` / `builder` fields. Builder attribution is carried in the signed `builder` field — no more `POLY_BUILDER_*` HMAC headers for order submission. See [Polymarket CLOB V2 migration guide](https://docs.polymarket.com/migration/clob-v2) for background.
+
 ## Features
 
 - **Simple API**: Just a few lines of code to start trading
-- **Gasless Transactions**: No gas fees with Builder Program credentials
+- **CLOB V2 order format**: V2 domain + `builder` attribution field baked into every order
+- **Gasless Transactions**: Relayer-backed gasless execution via Builder Program credentials
 - **Real-time WebSocket**: Live orderbook updates via WebSocket
 - **15-Minute Markets**: Built-in support for BTC/ETH/SOL/XRP 15-minute Up/Down markets
 - **Flash Crash Strategy**: Pre-built strategy for volatility trading
 - **Terminal UI**: Real-time orderbook display with in-place updates
 - **Secure Key Storage**: Private keys encrypted with PBKDF2 + Fernet
-- **Fully Tested**: 89 unit tests covering all functionality
+- **Fully Tested**: 103 unit tests covering all functionality
 
 ## Quick Start (5 Minutes)
 
@@ -223,9 +226,11 @@ polymarket-trading-bot/
 |----------|----------|-------------|
 | `POLY_PRIVATE_KEY` | Yes | Your wallet private key |
 | `POLY_SAFE_ADDRESS` | Yes | Your Polymarket Safe address |
-| `POLY_BUILDER_API_KEY` | For gasless | Builder Program API key |
-| `POLY_BUILDER_API_SECRET` | For gasless | Builder Program secret |
-| `POLY_BUILDER_API_PASSPHRASE` | For gasless | Builder Program passphrase |
+| `POLY_BUILDER_CODE` | For attribution | V2 builder code (bytes32 hex) stamped on every order |
+| `POLY_BUILDER_API_KEY` | For gasless | Builder Program API key (Relayer HMAC) |
+| `POLY_BUILDER_API_SECRET` | For gasless | Builder Program secret (Relayer HMAC) |
+| `POLY_BUILDER_API_PASSPHRASE` | For gasless | Builder Program passphrase (Relayer HMAC) |
+| `POLY_CLOB_HOST` | No | Override CLOB host (use `https://clob-v2.polymarket.com` to test V2 pre-cutover) |
 
 ### Config File (Alternative)
 
@@ -234,8 +239,16 @@ Create `config.yaml`:
 ```yaml
 safe_address: "0xYourSafeAddress"
 
-# For gasless trading (optional)
+clob:
+  host: "https://clob.polymarket.com"
+  chain_id: 137
+  signature_type: 2
+  neg_risk: false   # true for Neg Risk markets
+
 builder:
+  # CLOB V2: builder_code attributes orders to your builder account
+  builder_code: "0x...32-byte-hex..."
+  # Relayer HMAC creds (only needed for gasless transactions)
   api_key: "your_api_key"
   api_secret: "your_api_secret"
   api_passphrase: "your_passphrase"
@@ -247,20 +260,33 @@ Then load it:
 bot = TradingBot(config_path="config.yaml", private_key="0x...")
 ```
 
-## Gasless Trading
+## Builder Attribution & Gasless Trading
 
-To eliminate gas fees:
+CLOB V2 splits builder usage into two independent pieces:
 
-1. Apply for [Builder Program](https://polymarket.com/settings?tab=builder)
-2. Set the environment variables:
+1. **Order attribution (`builder_code`)** — a bytes32 hex code copied from
+   [polymarket.com/settings?tab=builder](https://polymarket.com/settings?tab=builder)
+   and stamped onto every signed order. Public identifier.
 
-```bash
-export POLY_BUILDER_API_KEY=your_key
-export POLY_BUILDER_API_SECRET=your_secret
-export POLY_BUILDER_API_PASSPHRASE=your_passphrase
-```
+   ```bash
+   export POLY_BUILDER_CODE=0x...32-byte-hex...
+   ```
 
-The bot will automatically use gasless mode when credentials are present.
+   When set, the bot injects it into every order's `builder` field automatically.
+   Per-order overrides are supported via `bot.place_order(..., builder_code=...)`.
+
+2. **Gasless execution (Relayer HMAC)** — the classic `POLY_BUILDER_API_KEY` /
+   `SECRET` / `PASSPHRASE` credentials still authenticate against the Relayer
+   for gasless Safe deployment, approvals, and cancels. These headers are no
+   longer used for `POST /order` under V2.
+
+   ```bash
+   export POLY_BUILDER_API_KEY=your_key
+   export POLY_BUILDER_API_SECRET=your_secret
+   export POLY_BUILDER_API_PASSPHRASE=your_passphrase
+   ```
+
+   The bot automatically enters gasless mode when all three are present.
 
 ## API Reference
 

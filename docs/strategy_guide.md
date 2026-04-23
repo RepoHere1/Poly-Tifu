@@ -38,13 +38,23 @@ export POLY_PRIVATE_KEY=0xYourPrivateKey
 export POLY_SAFE_ADDRESS=0xYourSafeAddress
 ```
 
-Optional (gasless mode):
+Optional — CLOB V2 builder attribution (stamped into every signed order):
+
+```bash
+export POLY_BUILDER_CODE=0x...32-byte-hex...
+```
+
+Optional — Relayer HMAC credentials (gasless Safe deploy / approvals / cancels):
 
 ```bash
 export POLY_BUILDER_API_KEY=...
 export POLY_BUILDER_API_SECRET=...
 export POLY_BUILDER_API_PASSPHRASE=...
 ```
+
+> Under CLOB V2 these HMAC headers are no longer used for `POST /order` —
+> attribution moves into the signed `builder` field. They remain in use for
+> the Relayer (gasless) endpoints.
 
 Quick connectivity check:
 

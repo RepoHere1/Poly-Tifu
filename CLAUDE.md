@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A beginner-friendly Python trading bot for Polymarket with gasless transactions via Builder Program. Uses EIP-712 signing for orders, encrypted private key storage, and supports both the CLOB API and Relayer API.
 
+**CLOB V2.** Orders are signed against the V2 Exchange domain (`Polymarket CTF Exchange`, version `2`) with the new `timestamp` / `metadata` / `builder` fields. Builder attribution lives in the signed `builder` field on every order — `POLY_BUILDER_*` HMAC headers are no longer used for `POST /order`. They remain in use for the Relayer (gasless) endpoints.
+
 ## Common Commands
 
 ```bash
@@ -25,7 +27,7 @@ python scripts/run_bot.py              # Quick demo
 python scripts/run_bot.py --interactive # Interactive mode
 
 # Testing
-pytest tests/ -v                        # Run all tests (89 tests)
+pytest tests/ -v                        # Run all tests (103 tests)
 pytest tests/test_utils.py -v           # Test utility functions
 pytest tests/test_bot.py -v             # Test bot module
 pytest tests/test_crypto.py -v          # Test encryption
@@ -75,16 +77,17 @@ pytest tests/test_signer.py -v          # Test EIP-712 signing
 
 ### Data Flow
 
-1. `TradingBot.place_order()` creates an `Order` dataclass
-2. `OrderSigner.sign_order()` produces EIP-712 signature
-3. `ClobClient.post_order()` submits to CLOB with Builder HMAC auth headers
-4. If gasless enabled, `RelayerClient` handles Safe deployment/approvals
+1. `TradingBot.place_order()` creates an `Order` dataclass (V2: includes `timestamp_ms`, `metadata`, `builder_code`)
+2. `OrderSigner.sign_order()` produces an EIP-712 signature against the V2 Exchange domain and embeds it inside the wire order
+3. `ClobClient.post_order()` submits the signed V2 order to CLOB; builder attribution rides in the signed `builder` field (no HMAC headers)
+4. If gasless enabled, `RelayerClient` handles Safe deployment/approvals/cancels using the `POLY_BUILDER_*` HMAC credentials
 
 ## Key Patterns
 
 - **Async methods**: All trading operations (`place_order`, `cancel_order`, `get_trades`) are async
 - **Config precedence**: Environment vars > YAML file > defaults
-- **Builder HMAC auth**: Timestamp + method + path + body signed with api_secret
+- **V2 builder attribution**: bytes32 `builder_code` stamped into every signed order's `builder` field
+- **Relayer HMAC auth**: Timestamp + method + path + body signed with api_secret (gasless endpoints only)
 - **Signature type 2**: Gnosis Safe signatures for Polymarket
 
 ## Configuration
@@ -104,8 +107,10 @@ config = Config.load_with_env("config.yaml")
 
 Key fields:
 - `safe_address`: Your Polymarket proxy wallet address
-- `builder.api_key/api_secret/api_passphrase`: For gasless trading
+- `builder.builder_code`: bytes32 hex attributed on every V2 order (`POLY_BUILDER_CODE`)
+- `builder.api_key/api_secret/api_passphrase`: Relayer HMAC creds for gasless trading
 - `clob.chain_id`: 137 (Polygon mainnet)
+- `clob.neg_risk`: set `true` for Neg Risk markets (switches V2 Exchange address)
 
 ## Testing Notes
 

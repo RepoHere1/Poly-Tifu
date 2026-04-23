@@ -4,16 +4,19 @@
 
 一个新手友好的 Python 交易机器人，支持 Polymarket 无 Gas 交易和实时 WebSocket 数据。
 
+> **已适配 CLOB V2。** 订单按 V2 Exchange 域（`Polymarket CTF Exchange`，version `2`）签名，新增 `timestamp` / `metadata` / `builder` 字段。Builder 归因通过订单中签名的 `builder` 字段实现——V2 下提交订单时不再需要 `POLY_BUILDER_*` HMAC 请求头。详情参见 [Polymarket CLOB V2 迁移指南](https://docs.polymarket.com/migration/clob-v2)。
+
 ## 特性
 
 - **简单易用**：几行代码即可开始交易
-- **零 Gas 费用**：使用 Builder Program 凭证免除 Gas 费
+- **CLOB V2 订单格式**：V2 域 + 订单内签名的 `builder` 归因字段
+- **零 Gas 费用**：通过 Relayer 与 Builder Program 凭证实现无 Gas 交易
 - **实时 WebSocket**：通过 WebSocket 实时获取订单簿更新
 - **15分钟市场**：内置支持 BTC/ETH/SOL/XRP 15分钟涨跌市场
 - **闪崩策略**：预置波动率交易策略
 - **终端界面**：实时订单簿显示，原地更新
 - **安全存储**：私钥使用 PBKDF2 + Fernet 加密保护
-- **完整测试**：89 个单元测试覆盖所有功能
+- **完整测试**：103 个单元测试覆盖所有功能
 
 ## 快速开始（5 分钟）
 
@@ -223,9 +226,11 @@ polymarket-trading-bot/
 |--------|------|------|
 | `POLY_PRIVATE_KEY` | 是 | 你的钱包私钥 |
 | `POLY_SAFE_ADDRESS` | 是 | 你的 Polymarket Safe 地址 |
-| `POLY_BUILDER_API_KEY` | 无 Gas 需要 | Builder Program API 密钥 |
-| `POLY_BUILDER_API_SECRET` | 无 Gas 需要 | Builder Program 密钥 |
-| `POLY_BUILDER_API_PASSPHRASE` | 无 Gas 需要 | Builder Program 口令 |
+| `POLY_BUILDER_CODE` | 归因 | V2 Builder code（bytes32 十六进制），写入每个订单 |
+| `POLY_BUILDER_API_KEY` | 无 Gas 需要 | Builder Program API 密钥（Relayer HMAC） |
+| `POLY_BUILDER_API_SECRET` | 无 Gas 需要 | Builder Program 密钥（Relayer HMAC） |
+| `POLY_BUILDER_API_PASSPHRASE` | 无 Gas 需要 | Builder Program 口令（Relayer HMAC） |
+| `POLY_CLOB_HOST` | 否 | 覆盖 CLOB 域名（切换前可用 `https://clob-v2.polymarket.com` 测试 V2） |
 
 ### 配置文件（另一种方式）
 
@@ -234,8 +239,16 @@ polymarket-trading-bot/
 ```yaml
 safe_address: "0x你的Safe地址"
 
-# 无 Gas 交易（可选）
+clob:
+  host: "https://clob.polymarket.com"
+  chain_id: 137
+  signature_type: 2
+  neg_risk: false   # Neg Risk 市场请置为 true
+
 builder:
+  # CLOB V2：builder_code 为订单归因字段
+  builder_code: "0x...32字节十六进制..."
+  # Relayer HMAC 凭证（仅无 Gas 交易需要）
   api_key: "你的api_key"
   api_secret: "你的api_secret"
   api_passphrase: "你的passphrase"
@@ -247,20 +260,32 @@ builder:
 bot = TradingBot(config_path="config.yaml", private_key="0x...")
 ```
 
-## 无 Gas 交易
+## Builder 归因 与 无 Gas 交易
 
-要免除 Gas 费用：
+CLOB V2 把 Builder 相关能力拆成两件独立的事：
 
-1. 申请 [Builder Program](https://polymarket.com/settings?tab=builder)
-2. 设置环境变量：
+1. **订单归因（`builder_code`）**：从
+   [polymarket.com/settings?tab=builder](https://polymarket.com/settings?tab=builder)
+   复制的 bytes32 十六进制 code，写入每个签名订单。属于公开标识。
 
-```bash
-export POLY_BUILDER_API_KEY=你的密钥
-export POLY_BUILDER_API_SECRET=你的密钥
-export POLY_BUILDER_API_PASSPHRASE=你的口令
-```
+   ```bash
+   export POLY_BUILDER_CODE=0x...32字节十六进制...
+   ```
 
-当凭证存在时，机器人会自动使用无 Gas 模式。
+   设置后，机器人会自动把它写进每个订单的 `builder` 字段；也可以按订单覆盖：
+   `bot.place_order(..., builder_code=...)`。
+
+2. **无 Gas 执行（Relayer HMAC）**：原有的 `POLY_BUILDER_API_KEY` /
+   `SECRET` / `PASSPHRASE` 仍然用于向 Relayer 认证，以完成 Safe 部署、
+   授权与撤单等无 Gas 操作。V2 下这组 HMAC 请求头**不再**用于 `POST /order`。
+
+   ```bash
+   export POLY_BUILDER_API_KEY=你的密钥
+   export POLY_BUILDER_API_SECRET=你的密钥
+   export POLY_BUILDER_API_PASSPHRASE=你的口令
+   ```
+
+   三者同时存在时，机器人会自动进入无 Gas 模式。
 
 ## API 参考
 

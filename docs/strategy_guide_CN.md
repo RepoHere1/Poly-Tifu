@@ -36,13 +36,22 @@ export POLY_PRIVATE_KEY=0x你的私钥
 export POLY_SAFE_ADDRESS=0x你的Safe地址
 ```
 
-可选（Builder gasless）：
+可选 —— CLOB V2 订单归因（写入每个签名订单）：
+
+```bash
+export POLY_BUILDER_CODE=0x...32字节十六进制...
+```
+
+可选 —— Relayer HMAC 凭证（用于无 Gas 的 Safe 部署 / 授权 / 撤单）：
 
 ```bash
 export POLY_BUILDER_API_KEY=...
 export POLY_BUILDER_API_SECRET=...
 export POLY_BUILDER_API_PASSPHRASE=...
 ```
+
+> CLOB V2 下这组 HMAC 请求头不再用于 `POST /order` —— 归因已改由签名订单里的
+> `builder` 字段承担。它们只保留给 Relayer（无 Gas）接口使用。
 
 先验证 WebSocket 是否正常：
 

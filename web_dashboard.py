@@ -16,8 +16,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from flask import Flask, jsonify, render_template_string
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+# Configure for Railway deployment - trust X-Forwarded- headers
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+
+# Disable Flask's strict host validation for Railway domains
+app.config['PREFERRED_URL_SCHEME'] = 'https'
 
 bot_state = {
     "status": "idle",
@@ -31,10 +37,15 @@ bot_state = {
     "has_credentials": False,
 }
 
-bot_instance = None
-running = True
-
-DASHBOARD_HTML = """
+# Configuration for Railway internal domains
+# Handle both .railway.internal and .up.railway.app domains
+ALLOWED_HOSTS = [
+    "*",  # Allow all hosts for flexibility
+    "poly-tifu.railway.internal",
+    "poly-tifu.up.railway.app",
+    "localhost",
+    "127.0.0.1",
+]
 <!doctype html>
 <html lang="en">
 <head>

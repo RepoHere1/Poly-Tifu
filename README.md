@@ -368,3 +368,4 @@ pytest tests/ -v --cov=src
 MIT License - see LICENSE file for details.
 # Trigger redeploy
 # Force redeploy with env vars
+# Force redeploy with service-level env vars

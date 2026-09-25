@@ -38,3 +38,4 @@ websockets>=12.0               # WebSocket client for market data
 pytest>=7.0.0                  # Test framework
 pytest-asyncio>=0.21.0         # Async test support
 pytest-cov>=4.0.0              # Code coverage
+flask

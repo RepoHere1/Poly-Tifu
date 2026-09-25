@@ -1,1 +1,1 @@
-worker: python scripts/run_bot.py
+worker: python scripts/run_continuous.py

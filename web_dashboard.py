@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Poly-Tifu Web Dashboard — standalone Flask server.
+Poly-Tifu Web Dashboard -- standalone Flask server.
 
 Shows what Poly-Tifu is, lists available strategies and modules,
 and displays live bot status if credentials are configured.
-Safe to run without any Polymarket credentials — falls back to
+Safe to run without any Polymarket credentials -- falls back to
 a read-only info dashboard.
 """
 import os
@@ -37,6 +37,8 @@ bot_state = {
     "has_credentials": False,
 }
 
+running = True
+
 # Configuration for Railway internal domains
 # Handle both .railway.internal and .up.railway.app domains
 ALLOWED_HOSTS = [
@@ -46,12 +48,14 @@ ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
 ]
+
+DASHBOARD_HTML = """
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Poly-Tifu — Polymarket Trading Bot Dashboard</title>
+<title>Poly-Tifu -- Polymarket Trading Bot Dashboard</title>
 <style>
 :root { --bg:#0a0f1a; --card:#111827; --border:#1e293b; --text:#e2e8f0;
          --muted:#94a3b8; --green:#22c55e; --red:#ef4444; --blue:#3b82f6;
@@ -102,7 +106,7 @@ footer { margin-top:2rem; text-align:center; color:var(--muted); font-size:.75re
 <body>
 <div class="container">
 <h1>🤖 Poly-Tifu</h1>
-<p class="subtitle">Polymarket Trading Bot — CLOB V2 · Gasless · Flash Crash Strategy · WebSocket Orderbook</p>
+<p class="subtitle">Polymarket Trading Bot -- CLOB V2 · Gasless · Flash Crash Strategy · WebSocket Orderbook</p>
 
 <div class="grid">
 <div class="stat">
@@ -132,9 +136,9 @@ BTC/ETH/SOL/XRP Up/Down markets. It signs orders against the CLOB V2 exchange do
 </p>
 <table>
 <tr><th>Component</th><th>File</th><th>Purpose</th></tr>
-<tr><td>Trading Bot Core</td><td><code>src/bot.py</code></td><td>Main bot class — orders, balance, market data</td></tr>
+<tr><td>Trading Bot Core</td><td><code>src/bot.py</code></td><td>Main bot class -- orders, balance, market data</td></tr>
 <tr><td>CLOB Client</td><td><code>src/client.py</code></td><td>Polymarket CLOB API interactions</td></tr>
-<tr><td>Gamma Client</td><td><code>src/gamma_client.py</code></td><td>Gamma API — market discovery</td></tr>
+<tr><td>Gamma Client</td><td><code>src/gamma_client.py</code></td><td>Gamma API -- market discovery</td></tr>
 <tr><td>Order Signer</td><td><code>src/signer.py</code></td><td>CLOB V2 order signing with builder attribution</td></tr>
 <tr><td>Flash Crash</td><td><code>strategies/flash_crash.py</code></td><td>Volatility dip-buying strategy</td></tr>
 <tr><td>Market Manager</td><td><code>lib/market_manager.py</code></td><td>Tracks active markets and orderbooks</td></tr>
@@ -176,7 +180,7 @@ Run this first to verify your setup works.</p>
 <div class="card">
 <h2>💰 Balance</h2>
 <pre id="balance" style="background:#020617; border:1px solid var(--border); border-radius:8px;
-     padding:1rem; overflow:auto; font-size:.8rem;">Not available — set POLY_PRIVATE_KEY + POLY_SAFE_ADDRESS env vars</pre>
+     padding:1rem; overflow:auto; font-size:.8rem;">Not available -- set POLY_PRIVATE_KEY + POLY_SAFE_ADDRESS env vars</pre>
 </div>
 
 <div class="card">
@@ -212,11 +216,11 @@ async function loadData() {
     document.getElementById('creds').className = data.has_credentials ? 'stat-value green' : 'stat-value';
     document.getElementById('lastPrice').textContent = data.last_price || '-';
     document.getElementById('activity').textContent = data.recent_activity && data.recent_activity.length
-      ? data.recent_activity.map(e => `${e.time} — ${e.error}`).join('\\n')
+      ? data.recent_activity.map(e => `${e.time} -- ${e.error}`).join('\\n')
       : 'No activity yet.';
     document.getElementById('balance').textContent = data.balance
       ? JSON.stringify(data.balance, null, 2)
-      : 'Not available — set POLY_PRIVATE_KEY + POLY_SAFE_ADDRESS env vars';
+      : 'Not available -- set POLY_PRIVATE_KEY + POLY_SAFE_ADDRESS env vars';
   } catch(e) {
     console.error(e);
   }
@@ -269,7 +273,7 @@ def _try_start_bot_loop():
         from src.bot import TradingBot
 
         if not check_env_mode():
-            print("[web_dashboard] No credentials found — running in info-only mode")
+            print("[web_dashboard] No credentials found -- running in info-only mode")
             bot_state["status"] = "idle"
             return
 
@@ -280,7 +284,7 @@ def _try_start_bot_loop():
         bot_instance = bot
         bot_state["bot_initialized"] = True
         bot_state["status"] = "running"
-        print("[web_dashboard] Bot initialized — running trading loop")
+        print("[web_dashboard] Bot initialized -- running trading loop")
 
         import asyncio
 
@@ -288,11 +292,11 @@ def _try_start_bot_loop():
     except Exception as e:
         bot_state["status"] = "error"
         bot_state["errors"].append({"time": time.strftime("%H:%M:%S"), "error": f"Bot init failed: {e}"})
-        print(f"[web_dashboard] Bot not started: {e} — running in info-only mode")
+        print(f"[web_dashboard] Bot not started: {e} -- running in info-only mode")
 
 
 async def _bot_loop(bot):
-    """Lightweight bot status loop — no actual trading, just monitoring."""
+    """Lightweight bot status loop -- no actual trading, just monitoring."""
     global bot_state
     interval = int(os.environ.get("POLY_BOT_INTERVAL", "60"))
     iteration = 0

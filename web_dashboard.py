@@ -13,11 +13,12 @@ import time
 import json
 import threading
 import asyncio
+import functools
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from flask import Flask, jsonify, request, render_template_string, Response
+from flask import Flask, jsonify, request, Response
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
@@ -39,13 +40,114 @@ bot_state = {
     "has_credentials": False,
     "neg_risk": False,
     "strategy": "none",
+    "strategy_config": {},
+    "strategy_running": False,
+    "strategy_error": None,
     "recent_trades": [],
     "alerts": [],
+    "market": None,
 }
 
 running = True
 bot_instance = None
 bot_loop_loop = None
+
+strategy_instance = None
+strategy_task = None
+strategy_loop = None
+strategy_lock = threading.Lock()
+GAMMA_CLIENT_CLS = None
+
+
+def _warm_imports():
+    """Import the src package once, on the main thread, before any concurrency.
+
+    src/__init__.py eagerly imports bot, client, crypto and the websocket stack.
+    Letting two worker threads trigger those imports at once deadlocks on the
+    per-module import locks, so it is done up front and serialized.
+    """
+    global GAMMA_CLIENT_CLS
+    try:
+        from src.gamma_client import GammaClient
+        GAMMA_CLIENT_CLS = GammaClient
+        print("[web_dashboard] src package imported")
+    except Exception as e:
+        print(f"[web_dashboard] src import failed, market polling disabled: {e}")
+
+STRATEGY_CATALOG = {
+    "none": {
+        "label": "None (idle)",
+        "module": None,
+        "summary": "No automated strategy. The bot only polls status and serves this dashboard.",
+        "detail": "Read-only mode. Safe default. Order placement still works from the Order panel.",
+        "risk": "None",
+        "params": {},
+    },
+    "flash_crash": {
+        "label": "Flash Crash",
+        "module": "strategies/flash_crash.py",
+        "summary": "Buys the side whose probability just collapsed, betting on a snap-back.",
+        "detail": (
+            "Streams the live orderbook for both outcomes of the current 15-minute market. "
+            "When either probability falls by the drop threshold inside the lookback window, "
+            "it market-buys the crashed side and exits on take-profit or stop-loss."
+        ),
+        "risk": "High -- buys falling knives",
+        "params": {"drop_threshold": 0.30, "lookback": 10, "take_profit": 0.10, "stop_loss": 0.05},
+    },
+    "grid": {
+        "label": "Grid",
+        "module": "strategies/grid.py",
+        "summary": "Places a ladder of limit orders around the mid price to farm oscillation.",
+        "detail": (
+            "Computes mid from the Up/Down pair, then rebuilds a two-sided ladder across a "
+            "percentage range on every tick: buys below mid, sells above. Each rebuild cancels "
+            "the previous ladder first, so exposure stays bounded."
+        ),
+        "risk": "Medium -- many small orders, spread/fee drag",
+        "params": {"levels": 5, "range_pct": 2.0, "size": 10.0, "price_offset_pct": 0.1},
+    },
+    "arb": {
+        "label": "Arb",
+        "module": "strategies/arb.py",
+        "summary": "Trades the Up+Down pair when the two prices stop summing to 1.00.",
+        "detail": (
+            "For a binary market the two outcomes must total 1.00. When the observed sum drifts "
+            "past the threshold the pair is mispriced, so it buys the cheap leg and exits when "
+            "the discrepancy normalises."
+        ),
+        "risk": "Medium -- thin 15m books, fees can eat the edge",
+        "params": {"threshold": 0.05, "size": 5.0},
+    },
+}
+
+MODULE_MAP = [
+    ("src/bot.py", "TradingBot", "High-level trading facade. Signs and submits orders, cancels, reads balances/trades."),
+    ("src/signer.py", "OrderSigner", "EIP-712 signing against the CLOB V2 exchange domain, with the builder field stamped in."),
+    ("src/client.py", "ClobClient / RelayerClient", "Talks to clob.polymarket.com for orders and relayer-v2.polymarket.com for gasless txs."),
+    ("src/config.py", "Config / BuilderConfig", "Layered config: env vars beat config.yaml beat defaults."),
+    ("src/crypto.py", "KeyManager", "PBKDF2 + Fernet encryption so the private key is never stored in plaintext."),
+    ("src/gamma_client.py", "GammaClient", "Discovers the current 15-minute Up/Down market for a coin and parses its token ids and prices."),
+    ("src/websocket_client.py", "WebSocketClient", "Live Polymarket market-channel orderbook feed with snapshot + delta handling."),
+    ("lib/market_manager.py", "MarketManager", "Keeps the active market and token ids fresh; auto-switches at each 15-minute boundary."),
+    ("lib/price_tracker.py", "PriceTracker", "Rolling mid-price history and short-window volatility for strategy signals."),
+    ("lib/position_manager.py", "PositionManager", "Tracks open positions and enforces take-profit / stop-loss / max-position limits."),
+    ("strategies/", "FlashCrash / Grid / Arb", "The three automated strategies. Each implements on_tick(prices) over the shared base class."),
+    ("web_dashboard.py", "Flask app", "This page plus the JSON API, SSE alert stream, and the background bot loop."),
+]
+
+ENV_VARS = [
+    ("POLY_PRIVATE_KEY", "required to trade", "Wallet private key. Without it the dashboard runs read-only."),
+    ("POLY_SAFE_ADDRESS", "required to trade", "Your Polymarket Safe/proxy address -- the maker on every order."),
+    ("POLY_BUILDER_CODE", "attribution", "bytes32 code stamped into the signed builder field on every order."),
+    ("POLY_BUILDER_API_KEY / _SECRET / _PASSPHRASE", "gasless", "HMAC credentials used by the relayer for gasless cancels/approvals."),
+    ("POLY_CHAIN_ID", "137", "Polygon chain id. 137 = mainnet."),
+    ("POLY_RPC_URL", "polygon-rpc.com", "Polygon RPC endpoint for on-chain reads."),
+    ("POLY_DASHBOARD_KEY", "unset", "When set, every /api/* route requires it as X-API-Key (or ?key= for the SSE stream)."),
+    ("POLY_BOT_INTERVAL", "60", "Seconds between bot status poll iterations."),
+    ("POLY_DEFAULT_COIN", "BTC", "Coin whose 15-minute market the Market Selector loads first."),
+    ("PORT", "8080", "HTTP port. Railway injects this automatically."),
+]
 
 ALLOWED_HOSTS = [
     "*",
@@ -61,324 +163,449 @@ DASHBOARD_HTML = """
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Poly-Tifu -- Polymarket Trading Bot Dashboard</title>
+<title>Poly-Tifu -- Polymarket Trading Bot</title>
 <style>
-:root { --bg:#0a0f1a; --card:#111827; --border:#1e293b; --text:#e2e8f0;
-         --muted:#94a3b8; --green:#22c55e; --red:#ef4444; --blue:#3b82f6;
-         --yellow:#eab308; --purple:#a855f7; }
+:root { --bg:#0a0f1a; --card:#111827; --card2:#0b1220; --border:#1e293b;
+        --text:#e2e8f0; --muted:#94a3b8; --green:#22c55e; --red:#ef4444;
+        --blue:#3b82f6; --yellow:#eab308; --purple:#a855f7; }
 * { box-sizing:border-box; margin:0; padding:0; }
 body { font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
        background:var(--bg); color:var(--text); min-height:100vh; padding:24px; }
-.container { max-width:1200px; margin:0 auto; }
+.container { max-width:1180px; margin:0 auto; }
 h1 { font-size:1.75rem; font-weight:700; margin-bottom:.25rem; }
-.subtitle { color:var(--muted); margin-bottom:1.5rem; font-size:.9rem; }
+.subtitle { color:var(--muted); margin-bottom:1.25rem; font-size:.9rem; }
+h2.sec { font-size:1rem; font-weight:600; color:#fff; margin-bottom:.75rem; }
 .card { background:var(--card); border:1px solid var(--border); border-radius:12px;
-         padding:1.25rem; margin-bottom:1rem; }
-.card h2 { font-size:1rem; font-weight:600; margin-bottom:.75rem; color:#fff; }
-.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+        padding:1.25rem; margin-bottom:1rem; }
+.card p { font-size:.88rem; line-height:1.6; color:#cbd5e1; }
+.card p + p { margin-top:.6rem; }
+.card ul { margin:.6rem 0 0 1.1rem; }
+.card li { font-size:.87rem; line-height:1.6; color:#cbd5e1; margin-bottom:.3rem; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
         gap:1rem; margin-bottom:1rem; }
 .stat { text-align:center; background:var(--card); border:1px solid var(--border);
         border-radius:12px; padding:1rem; }
-.stat-value { font-size:1.6rem; font-weight:700; }
-.stat-label { font-size:.8rem; color:var(--muted); margin-top:.35rem; }
-.green { color:var(--green); } .red { color:var(--red); }
-.blue { color:var(--blue); } .yellow { color:var(--yellow); }
-.purple { color:var(--purple); }
-ul { list-style:none; padding:0; }
-li { padding:.5rem 0; border-bottom:1px solid var(--border); font-size:.9rem; }
-li:last-child { border-bottom:none; }
-code { background:#020617; padding:2px 6px; border-radius:4px; font-size:.85rem; }
-.badge { display:inline-block; padding:2px 8px; border-radius:12px; font-size:.7rem;
-         font-weight:600; }
+.stat-value { font-size:1.5rem; font-weight:700; }
+.stat-label { font-size:.75rem; color:var(--muted); margin-top:.35rem;
+              text-transform:uppercase; letter-spacing:.04em; }
+.green { color:var(--green); } .red { color:var(--red); } .blue { color:var(--blue); }
+.yellow { color:var(--yellow); } .purple { color:var(--purple); } .muted { color:var(--muted); }
+.badge { display:inline-block; padding:3px 10px; border-radius:12px; font-size:.7rem;
+         font-weight:700; letter-spacing:.03em; }
 .badge.run { background:#064e3b; color:var(--green); }
 .badge.idle { background:#1e293b; color:var(--muted); }
 .badge.error { background:#450a0a; color:var(--red); }
-.strategy-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:1rem; }
-.strategy { background:#0b1220; border:1px solid var(--border); border-radius:8px;
-            padding:1rem; }
-.strategy h3 { font-size:.95rem; color:#fff; margin-bottom:.4rem; }
-.strategy p { font-size:.8rem; color:var(--muted); margin-bottom:.6rem; line-height:1.4; }
-.strategy .cmd { font-size:.75rem; color:var(--blue); font-family:monospace; }
-table { width:100%; border-collapse:collapse; font-size:.85rem; }
-th { text-align:left; padding:.5rem; color:var(--muted); font-size:.75rem;
-     text-transform:uppercase; border-bottom:2px solid var(--border); }
-td { padding:.5rem; border-bottom:1px solid var(--border); }
-.refresh-btn { background:var(--blue); color:white; border:none; padding:.6rem 1.2rem;
-               border-radius:8px; cursor:pointer; font-weight:600; font-size:.85rem; }
-.refresh-btn:hover { opacity:.9; }
-footer { margin-top:2rem; text-align:center; color:var(--muted); font-size:.75rem; }
-.form-row { display:flex; gap:.5rem; flex-wrap:wrap; align-items:end; margin-bottom:1rem; }
-.form-group { display:flex; flex-direction:column; gap:.25rem; }
-.form-group label { font-size:.75rem; color:var(--muted); }
-.form-group input, .form-group select { background:#020617; border:1px solid var(--border);
-  color:var(--text); padding:.4rem .6rem; border-radius:6px; font-size:.85rem; }
-.form-group input:focus, .form-group select:focus { border-color:var(--blue); outline:none; }
-.btn { background:var(--blue); color:white; border:none; padding:.5rem 1rem;
+.badge.warn { background:#3b2e0a; color:var(--yellow); }
+code, .mono { background:#020617; padding:2px 6px; border-radius:4px;
+              font-size:.8rem; font-family:ui-monospace,Menlo,Consolas,monospace;
+              word-break:break-all; }
+table { width:100%; border-collapse:collapse; font-size:.84rem; }
+th { text-align:left; padding:.5rem; color:var(--muted); font-size:.7rem;
+     text-transform:uppercase; letter-spacing:.04em; border-bottom:2px solid var(--border); }
+td { padding:.5rem; border-bottom:1px solid var(--border); vertical-align:top; }
+tbody tr:hover { background:#0d1526; }
+.btn { background:var(--blue); color:#fff; border:none; padding:.5rem 1rem;
        border-radius:8px; cursor:pointer; font-weight:600; font-size:.8rem; }
 .btn:hover { opacity:.9; }
-.btn.danger { background:var(--red); }
-.btn.success { background:var(--green); }
-.alert { padding:.5rem .75rem; border-radius:8px; font-size:.8rem; margin-bottom:.5rem; }
-.alert.info { background:#1e3a5f; border-left:3px solid var(--blue); }
+.btn:disabled { opacity:.4; cursor:not-allowed; }
+.btn.danger { background:var(--red); } .btn.success { background:var(--green); }
+.btn.ghost { background:#1e293b; }
+.form-row { display:flex; gap:.6rem; flex-wrap:wrap; align-items:flex-end; }
+.form-group { display:flex; flex-direction:column; gap:.25rem; }
+.form-group label { font-size:.72rem; color:var(--muted); text-transform:uppercase;
+                    letter-spacing:.04em; }
+.form-group input, .form-group select { background:#020617; border:1px solid var(--border);
+  color:var(--text); padding:.45rem .6rem; border-radius:6px; font-size:.85rem; }
+.form-group input:focus, .form-group select:focus { border-color:var(--blue); outline:none; }
+pre.out { background:#020617; border:1px solid var(--border); border-radius:8px;
+          padding:1rem; overflow:auto; font-size:.78rem; margin-top:.5rem;
+          max-height:220px; white-space:pre-wrap; }
+.alert { padding:.5rem .75rem; border-radius:6px; font-size:.8rem; margin-bottom:.4rem; }
+.alert.info { background:#12253f; border-left:3px solid var(--blue); }
 .alert.warn { background:#3b2e0a; border-left:3px solid var(--yellow); }
 .alert.error { background:#450a0a; border-left:3px solid var(--red); }
-.column { display:flex; flex-direction:column; gap:.25rem; }
+.banner { border-radius:10px; padding:.85rem 1rem; margin-bottom:1rem; font-size:.85rem;
+          line-height:1.5; border-left:4px solid; }
+.banner.live { background:#12253f; border-color:var(--blue); }
+.banner.armed { background:#450a0a; border-color:var(--red); }
+.banner b { color:#fff; }
+.flow li { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:.78rem; }
+.chip { display:inline-block; padding:2px 8px; border-radius:12px; font-size:.7rem;
+        font-weight:600; background:#1e293b; color:var(--muted); margin-right:.3rem; }
+.chip.risk-high { background:#450a0a; color:var(--red); }
+.chip.risk-medium { background:#3b2e0a; color:var(--yellow); }
+details { border-top:1px solid var(--border); padding:.6rem 0; }
+summary { cursor:pointer; font-size:.88rem; color:#fff; font-weight:600; }
+footer { margin-top:2rem; text-align:center; color:var(--muted); font-size:.75rem; }
+.note { font-size:.78rem; color:var(--muted); margin-top:.5rem; line-height:1.5; }
 </style>
 </head>
 <body>
 <div class="container">
-<h1>&#x1F916; Poly-Tifu</h1>
-<p class="subtitle">Polymarket Trading Bot -- CLOB V2 &middot; Gasless &middot; Flash Crash &middot; Grid/Arb &middot; WebSocket Orderbook &middot; SSE Stream</p>
+
+<h1>Poly-Tifu</h1>
+<p class="subtitle">Automated trading bot for Polymarket 15-minute crypto Up/Down markets &middot; CLOB V2 &middot; EIP-712 &middot; optional gasless</p>
+
+<div id="modeBanner" class="banner live">Checking credentials...</div>
 
 <div class="grid">
-<div class="stat">
-<div class="stat-value" id="status"><span class="badge idle" id="statusBadge">IDLE</span></div>
-<div class="stat-label">Bot Status</div>
-</div>
-<div class="stat">
-<div class="stat-value" id="iterations">0</div>
-<div class="stat-label">Iterations</div>
-</div>
-<div class="stat">
-<div class="stat-value" id="creds">No</div>
-<div class="stat-label">Credentials</div>
-</div>
-<div class="stat">
-<div class="stat-value" id="lastPrice">-</div>
-<div class="stat-label">Last Price</div>
-</div>
-<div class="stat">
-<div class="stat-value" id="strategy">none</div>
-<div class="stat-label">Strategy</div>
-</div>
-<div class="stat">
-<div class="stat-value" id="negRisk">Off</div>
-<div class="stat-label">Neg Risk</div>
-</div>
-</div>
-
-<div id="alerts"></div>
-
-<div class="card">
-<h2>&#x1F4C6; Place Order</h2>
-<div class="form-row">
-<div class="form-group">
-<label>Side</label>
-<select id="orderSide"><option>BUY</option><option>SELL</option></select>
-</div>
-<div class="form-group">
-<label>Token ID</label>
-<input id="orderToken" style="width:260px" placeholder="0x...">
-</div>
-<div class="form-group">
-<label>Price (0-1)</label>
-<input id="orderPrice" type="number" step="0.01" min="0" max="1" value="0.50" style="width:100px">
-</div>
-<div class="form-group">
-<label>Size</label>
-<input id="orderSize" type="number" step="0.1" min="0.1" value="10" style="width:100px">
-</div>
-<div class="form-group">
-<label>Type</label>
-<select id="orderType"><option>GTC</option><option>GTD</option><option>FOK</option></select>
-</div>
-<div class="form-group">
-<label>Neg Risk</label>
-<select id="orderNegRisk"><option value="false">No</option><option value="true">Yes</option></select>
-</div>
-<button class="btn success" onclick="placeOrder()">&#x2795; Place</button>
-<button class="btn danger" onclick="cancelOrder()">&#x2796; Cancel</button>
-<button class="btn" onclick="cancelAllOrders()">&#x2797; Cancel All</button>
-</div>
-<div id="orderResult" style="font-size:.85rem; margin-top:.5rem;"></div>
+  <div class="stat"><div class="stat-value"><span class="badge idle" id="statusBadge">IDLE</span></div><div class="stat-label">Bot</div></div>
+  <div class="stat"><div class="stat-value" id="creds">--</div><div class="stat-label">Can Trade</div></div>
+  <div class="stat"><div class="stat-value" id="lastPrice">--</div><div class="stat-label">Up Price</div></div>
+  <div class="stat"><div class="stat-value" id="openCount">0</div><div class="stat-label">Open Orders</div></div>
+  <div class="stat"><div class="stat-value" id="tradeCount">0</div><div class="stat-label">Trades</div></div>
+  <div class="stat"><div class="stat-value" id="strategyVal">none</div><div class="stat-label">Strategy</div></div>
 </div>
 
 <div class="card">
-<h2>&#x1F4C8; Market Selector</h2>
-<div class="form-row">
-<div class="form-group">
-<label>Coin</label>
-<select id="marketCoin" onchange="loadMarkets()">
-<option>BTC</option><option>ETH</option><option>SOL</option><option>XRP</option>
-</select>
-</div>
-<button class="btn" onclick="loadMarkets()">&#x1F504; Refresh</button>
-</div>
-<div id="marketsTable"></div>
+  <h2 class="sec">What this thing actually is</h2>
+  <p>Polymarket runs fast binary markets like <em>&quot;Bitcoin Up or Down, 6:15PM&ndash;6:30PM ET&quot;</em>. Each one asks a single yes/no question: did the Chainlink BTC/USD TWAP at the end of the window end up higher than it started? Exactly one side pays $1.00, the other pays $0.00.</p>
+  <p>A share's price between $0 and $1 <strong>is</strong> the crowd's live estimate of that chance. Buy at $0.45 and the outcome resolving your way turns it into $1.00; the other way it is worth nothing. So the entire game is buying outcomes that are mispriced relative to real information.</p>
+  <p>Poly-Tifu is the machine that watches for those mispricings and acts on them. It keeps a live WebSocket feed of both orderbooks, computes mid-prices and short-window volatility, and runs a trading strategy that places and cancels real limit orders on the Polymarket CLOB.</p>
+  <p><strong>Where the edge comes from:</strong> these markets expire every 15 minutes and are thin, so orderbooks routinely lag, cross, and gap right before a boundary. A strategy that reacts faster than a human clicking in a browser can capture part of that.</p>
+  <p><strong>The two halves:</strong> reading market data is free and public (Gamma API + WebSocket, no credentials). Placing orders requires your wallet &mdash; a private key and your Polymarket Safe address &mdash; and moves real USDC. Without those this whole page runs read-only and every trade button is disabled.</p>
+  <p><strong>Not financial advice.</strong> These are short-dated binary bets on an asset price, the books are thin, and most retail attempts lose money. Run it small.</p>
 </div>
 
 <div class="card">
-<h2>&#x1F3C1; Strategy</h2>
-<div class="form-row">
-<div class="form-group">
-<label>Strategy</label>
-<select id="strategySelect" onchange="setStrategy()">
-<option value="none">none</option>
-<option value="flash_crash">Flash Crash</option>
-<option value="grid">Grid</option>
-<option value="arb">Arb</option>
-</select>
-</div>
-<div class="form-group" id="gridParams" style="display:none">
-<label>Grid Levels</label>
-<input id="gridLevels" type="number" value="5" style="width:80px">
-<label>Range %</label>
-<input id="gridRange" type="number" step="0.1" value="2" style="width:80px">
-</div>
-<button class="btn" onclick="setStrategy()">Apply</button>
-</div>
+  <h2 class="sec">Live market</h2>
+  <div class="form-row">
+    <div class="form-group">
+      <label>Coin</label>
+      <select id="marketCoin">
+        <option>BTC</option><option>ETH</option><option>SOL</option><option>XRP</option>
+      </select>
+    </div>
+    <button class="btn ghost" onclick="loadMarkets()">Refresh</button>
+  </div>
+  <div id="marketsTable" style="margin-top:.85rem"></div>
+  <p class="note">Token IDs come straight from Polymarket. Click one to load it into the order form below.</p>
 </div>
 
 <div class="card">
-<h2>&#x1F4CA; Live Activity</h2>
-<pre id="activity" style="background:#020617; border:1px solid var(--border); border-radius:8px;
-     padding:1rem; overflow:auto; font-size:.8rem; max-height:200px;">Waiting for bot data...</pre>
+  <h2 class="sec">Place a manual order</h2>
+  <div class="form-row">
+    <div class="form-group"><label>Side</label>
+      <select id="orderSide"><option>BUY</option><option>SELL</option></select></div>
+    <div class="form-group"><label>Token ID</label>
+      <input id="orderToken" style="width:300px" placeholder="pick from the market above"></div>
+    <div class="form-group"><label>Price (0-1)</label>
+      <input id="orderPrice" type="number" step="0.01" min="0" max="1" value="0.50" style="width:90px"></div>
+    <div class="form-group"><label>Size</label>
+      <input id="orderSize" type="number" step="1" min="5" value="10" style="width:90px"></div>
+    <div class="form-group"><label>Type</label>
+      <select id="orderType"><option>GTC</option><option>GTD</option><option>FOK</option></select></div>
+    <div class="form-group"><label>Neg Risk</label>
+      <select id="orderNegRisk"><option value="false">No</option><option value="true">Yes</option></select></div>
+    <button class="btn success" id="btnPlace" onclick="placeOrder()">Place</button>
+    <button class="btn danger" id="btnCancel" onclick="cancelOrder()">Cancel</button>
+    <button class="btn ghost" id="btnCancelAll" onclick="cancelAllOrders()">Cancel all</button>
+  </div>
+  <p class="note">Signed locally with your private key via EIP-712 against the CLOB V2 exchange domain. Min size is 5 shares. Neg Risk switches the order to the Neg Risk exchange address.</p>
+  <pre class="out" id="orderResult">idle</pre>
 </div>
 
 <div class="card">
-<h2>&#x1F4B0; Balance</h2>
-<pre id="balance" style="background:#020617; border:1px solid var(--border); border-radius:8px;
-     padding:1rem; overflow:auto; font-size:.8rem;">Not available -- set POLY_PRIVATE_KEY + POLY_SAFE_ADDRESS env vars</pre>
+  <h2 class="sec">Automated strategy</h2>
+  <div class="form-row">
+    <div class="form-group"><label>Strategy</label>
+      <select id="strategySelect" onchange="syncStrategyForm()">
+        <option value="none">none</option>
+        <option value="flash_crash">Flash Crash</option>
+        <option value="grid">Grid</option>
+        <option value="arb">Arb</option>
+      </select></div>
+    <div class="form-group" id="fCoin" style="display:none"><label>Coin</label>
+      <select id="stratCoin"><option>BTC</option><option>ETH</option><option>SOL</option><option>XRP</option></select></div>
+    <div class="form-group" id="fLevels" style="display:none"><label>Grid Levels</label>
+      <input id="gridLevels" type="number" value="5" min="1" style="width:80px"></div>
+    <div class="form-group" id="fRange" style="display:none"><label>Range %</label>
+      <input id="gridRange" type="number" step="0.1" value="2" style="width:80px"></div>
+    <div class="form-group" id="fDrop" style="display:none"><label>Drop Threshold</label>
+      <input id="fcDrop" type="number" step="0.01" value="0.30" style="width:90px"></div>
+    <div class="form-group" id="fLookback" style="display:none"><label>Lookback (s)</label>
+      <input id="fcLookback" type="number" value="10" style="width:90px"></div>
+    <div class="form-group" id="fThresh" style="display:none"><label>Arb Threshold</label>
+      <input id="arbThresh" type="number" step="0.01" value="0.05" style="width:90px"></div>
+    <button class="btn" onclick="setStrategy()">Apply</button>
+  </div>
+  <p class="note" id="strategyNote">No strategy running.</p>
 </div>
 
 <div class="card">
-<h2>&#x1F4B6; Recent Trades</h2>
-<div id="tradesTable"></div>
+  <h2 class="sec">Open orders</h2>
+  <div id="openOrdersTable"></div>
 </div>
 
 <div class="card">
-<h2>&#x1F514; Alerts (SSE)</h2>
-<div id="alertLog" style="background:#020617; border:1px solid var(--border); border-radius:8px;
-     padding:1rem; overflow:auto; font-size:.8rem; max-height:150px;">Listening for alerts...</div>
+  <h2 class="sec">Recent trades</h2>
+  <div id="tradesTable"></div>
 </div>
 
 <div class="card">
-<h2>&#x1F527; Run Locally</h2>
-<pre style="background:#020617; border:1px solid var(--border); border-radius:8px;
-     padding:1rem; overflow:auto; font-size:.8rem;">
-pip install -r requirements.txt
-export POLY_PRIVATE_KEY=your_key
-export POLY_SAFE_ADDRESS=0xYourSafeAddress
-python scripts/run_continuous.py  # dashboard + bot loop
-python web_dashboard.py           # dashboard only (safe, no creds needed)
-</pre>
+  <h2 class="sec">Balance</h2>
+  <pre class="out" id="balance">unavailable without credentials</pre>
 </div>
 
-<button class="refresh-btn" onclick="loadData()">&#x21BB; Refresh</button>
+<div class="card">
+  <h2 class="sec">Event stream (SSE)</h2>
+  <div id="alertLog"><p class="note">connecting...</p></div>
+  <p class="note">Server-sent events pushed every 5 seconds, plus one-off alerts for strategy and bot state changes.</p>
+</div>
 
-<footer>
-Poly-Tifu &middot; Polymarket CLOB V2 Trading Bot &middot; Not financial advice
-</footer>
+<div class="card">
+  <h2 class="sec">Activity log</h2>
+  <pre class="out" id="activity">no activity yet</pre>
+</div>
+
+<div class="card">
+  <h2 class="sec">How the code is wired</h2>
+  <ol class="flow">
+    <li>1. Gamma API (<span class="mono">gamma-api.polymarket.com</span>) tells us which 15-minute market is live and what its two token IDs are.</li>
+    <li>2. WebSocket market channel streams orderbook snapshots and deltas for both tokens.</li>
+    <li>3. <span class="mono">lib/price_tracker.py</span> keeps rolling mid-prices; <span class="mono">lib/market_manager.py</span> rolls over to the next market on the 15-minute boundary.</li>
+    <li>4. The strategy's <span class="mono">on_tick(prices)</span> decides something is mispriced.</li>
+    <li>5. <span class="mono">src/bot.py</span> builds an order, <span class="mono">src/signer.py</span> EIP-712 signs it, <span class="mono">src/client.py</span> POSTs it to <span class="mono">clob.polymarket.com</span>.</li>
+    <li>6. The exchange matches it against the book; your Safe fills it against your USDC balance.</li>
+    <li>7. Every step above is also reported back here over the JSON API and the SSE stream.</li>
+  </ol>
+</div>
+
+<div class="card">
+  <h2 class="sec">Modules</h2>
+  <div id="moduleTable"></div>
+</div>
+
+<div class="card">
+  <h2 class="sec">Strategies</h2>
+  <div id="strategyTable"></div>
+</div>
+
+<div class="card">
+  <h2 class="sec">Environment variables</h2>
+  <div id="envTable"></div>
+</div>
+
+<div class="card">
+  <h2 class="sec">Run it locally</h2>
+  <pre class="out">pip install -r requirements.txt
+python web_dashboard.py            # this page + bot loop, no creds needed
+
+# with trading, add to .env:
+POLY_PRIVATE_KEY=0x...
+POLY_SAFE_ADDRESS=0x...
+POLY_BUILDER_CODE=0x...            # bytes32 attribution on every order</pre>
+</div>
+
+<footer>Poly-Tifu &middot; Polymarket CLOB V2 &middot; Polygon chain 137 &middot; Not financial advice</footer>
 </div>
 
 <script>
+const $ = (id) => document.getElementById(id);
+const AUTH = new URLSearchParams(location.search).get('key') || '';
+const H = AUTH ? { 'X-API-Key': AUTH } : {};
+const J = { ...H, 'Content-Type': 'application/json' };
+
+function txt(id, v) { $(id).textContent = (v === null || v === undefined || v === '') ? '--' : String(v); }
+function say(id, v) { $(id).textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2); }
+
 async function loadData() {
   try {
-    const res = await fetch('/api/status');
-    const d = await res.json();
-    const badge = document.getElementById('statusBadge');
-    badge.textContent = (d.status||'idle').toUpperCase();
-    badge.className = 'badge ' + (d.status==='running'?'run':d.status==='error'?'error':'idle');
-    document.getElementById('iterations').textContent = d.iterations||0;
-    document.getElementById('creds').textContent = d.has_credentials?'Yes':'No';
-    document.getElementById('creds').className = d.has_credentials?'stat-value green':'stat-value';
-    document.getElementById('lastPrice').textContent = d.last_price||'-';
-    document.getElementById('strategy').textContent = d.strategy||'none';
-    document.getElementById('negRisk').textContent = d.neg_risk?'On':'Off';
-    document.getElementById('negRisk').className = d.neg_risk?'stat-value yellow':'stat-value';
-    document.getElementById('activity').textContent = d.recent_activity&&d.recent_activity.length
-      ? d.recent_activity.map(e=>e.time+' -- '+e.error).join('\\n')
-      : 'No activity yet.';
-    document.getElementById('balance').textContent = d.balance
-      ? JSON.stringify(d.balance,null,2)
-      : 'Not available -- set POLY_PRIVATE_KEY + POLY_SAFE_ADDRESS env vars';
-  } catch(e) { console.error(e); }
+    const d = await (await fetch('/api/status', { headers: H })).json();
+    if (d.error) { say('activity', d.error); return; }
+
+    const badge = $('statusBadge');
+    badge.textContent = (d.status || 'idle').toUpperCase();
+    badge.className = 'badge ' + (d.status === 'running' ? 'run' : d.status === 'error' ? 'error' : 'idle');
+
+    txt('creds', d.has_credentials ? 'YES' : 'NO');
+    $('creds').className = 'stat-value ' + (d.has_credentials ? 'green' : 'yellow');
+    txt('lastPrice', d.last_price);
+    txt('openCount', d.open_orders_count || 0);
+    txt('tradeCount', (d.recent_trades || []).length);
+    txt('strategyVal', d.strategy || 'none');
+    $('strategyVal').className = 'stat-value ' + (d.strategy_running ? 'green' : 'purple');
+
+    const armed = d.has_credentials;
+    $('modeBanner').className = 'banner ' + (armed ? 'armed' : 'live');
+    $('modeBanner').innerHTML = armed
+      ? '<b>ARMED &mdash; real money.</b> Wallet credentials are loaded, so this bot can place, match, and lose real USDC. Strategies you start below will trade live.'
+      : '<b>READ-ONLY.</b> No <span class="mono">POLY_PRIVATE_KEY</span> / <span class="mono">POLY_SAFE_ADDRESS</span>, so market data is live but no orders can be signed or sent. Trading controls are disabled.';
+    ['btnPlace', 'btnCancel', 'btnCancelAll'].forEach(b => { if ($(b)) $(b).disabled = !armed; });
+
+    $('openOrdersTable').innerHTML = (d.open_orders && d.open_orders.length)
+      ? '<table><thead><tr><th>Order ID</th><th>Side</th><th>Price</th><th>Size</th><th>Status</th></tr></thead><tbody>'
+        + d.open_orders.map(o => '<tr><td><code>' + (o.id || '-') + '</code></td><td>' + (o.side || '-')
+        + '</td><td>' + (o.price ?? '-') + '</td><td>' + (o.original_size ?? o.size ?? '-')
+        + '</td><td>' + (o.status || '-') + '</td></tr>').join('') + '</tbody></table>'
+      : '<p class="note">none</p>';
+
+    $('tradesTable').innerHTML = (d.recent_trades && d.recent_trades.length)
+      ? '<table><thead><tr><th>Time</th><th>Market</th><th>Side</th><th>Price</th><th>Size</th></tr></thead><tbody>'
+        + d.recent_trades.map(t => '<tr><td>' + (t.timestamp || t.created_at || '-') + '</td><td>'
+        + (t.market || t.title || t.token_id || '-') + '</td><td>' + (t.side || '-') + '</td><td>'
+        + (t.price ?? '-') + '</td><td>' + (t.size ?? '-') + '</td></tr>').join('') + '</tbody></table>'
+      : '<p class="note">none</p>';
+
+    say('balance', d.balance ? d.balance : 'unavailable without credentials');
+
+    const act = d.recent_activity || [];
+    say('activity', act.length ? act.map(e => (e.time || '') + '  ' + (e.error || '')).join(String.fromCharCode(10)) : 'no activity yet');
+
+    const det = d.strategy_detail || {};
+    $('strategyNote').textContent = det.detail
+      ? (d.strategy + ': ' + det.summary + (d.strategy_error ? ' -- ' + d.strategy_error : (d.strategy_running ? ' -- running.' : ' -- selected, not running.')))
+      : 'No strategy running.';
+  } catch (e) { say('activity', 'status fetch failed: ' + e.message); }
 }
-setInterval(loadData, 5000);
-loadData();
 
 async function loadMarkets() {
-  const coin = document.getElementById('marketCoin').value;
-  const res = await fetch('/api/markets?coin='+coin);
-  const m = await res.json();
-  const el = document.getElementById('marketsTable');
-  if (!m || !m.question) { el.innerHTML='<p>No market found</p>'; return; }
-  const up = m.outcomes&&m.outcomes[0]||{};
-  const dn = m.outcomes&&m.outcomes[1]||{};
-  el.innerHTML = '<table><tr><th>Outcome</th><th>Token ID</th><th>Price</th><th>Volume</th></tr>'+
-    '<tr><td>UP</td><td><code>'+(up.id||'-')+'</code></td><td>'+(up.price||'-')+'</td><td>'+(up.volume||'-')+'</td></tr>'+
-    '<tr><td>DOWN</td><td><code>'+(dn.id||'-')+'</code></td><td>'+(dn.price||'-')+'</td><td>'+(dn.volume||'-')+'</td></tr>'+
-    '</table><p style="font-size:.8rem;color:var(--muted);margin-top:.5rem">Accepting orders: '+(m.acceptingOrders?'Yes':'No')+' &middot; End Date: '+(m.endDate||'-')+'</p>';
+  const coin = $('marketCoin').value;
+  const el = $('marketsTable');
+  el.innerHTML = '<p class="note">loading ' + coin + ' market...</p>';
+  try {
+    const r = await fetch('/api/markets?coin=' + coin, { headers: H });
+    const m = await r.json();
+    if (!r.ok || m.error) { el.innerHTML = '<p class="note">' + (m.error || 'no market') + '</p>'; return; }
+    const line = (name, o) => '<tr><td>' + name + '</td><td><code>' + (o.id || '-')
+      + '</code></td><td>' + (o.price ?? '-') + '</td><td>' + (o.last_trade ?? '-')
+      + '</td><td><button class="btn ghost" data-token="'
+      + (o.id || '') + '">use</button></td></tr>';
+    el.innerHTML =
+      '<p style="font-size:.85rem;margin-bottom:.6rem"><strong>' + (m.question || '-') + '</strong></p>'
+      + '<table><thead><tr><th>Outcome</th><th>Token ID</th><th>Mark</th><th>Last trade</th><th></th></tr></thead><tbody>'
+      + line('UP', m.up || {}) + line('DOWN', m.down || {}) + '</tbody></table>'
+      + '<p class="note">Book top: bid ' + (m.best_bid ?? '-') + ' / ask ' + (m.best_ask ?? '-')
+      + ' &middot; spread ' + (m.spread ?? '-') + ' &middot; ends ' + (m.end_date || '-')
+      + ' &middot; volume ' + (m.volume ?? '-') + ' &middot; accepting orders: '
+      + (m.accepting_orders ? 'yes' : 'no')
+      + ' &middot; mark and last trade come from Gamma and can lag the live book, so price limits off the bid/ask.</p>';
+  } catch (e) { el.innerHTML = '<p class="note">market fetch failed: ' + e.message + '</p>'; }
 }
 
+function useToken(id) {
+  if (!id) return;
+  $('orderToken').value = id;
+  $('orderToken').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+$('marketsTable').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button[data-token]');
+  if (btn) useToken(btn.dataset.token);
+});
+
 async function placeOrder() {
-  const side = document.getElementById('orderSide').value;
-  const token = document.getElementById('orderToken').value;
-  const price = parseFloat(document.getElementById('orderPrice').value);
-  const size = parseFloat(document.getElementById('orderSize').value);
-  const type = document.getElementById('orderType').value;
-  const neg = document.getElementById('orderNegRisk').value==='true';
-  const r = await fetch('/api/order', {method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({side,token_id:token,price,size,order_type:type,neg_risk:neg})});
-  const d = await r.json();
-  document.getElementById('orderResult').textContent = JSON.stringify(d,null,2);
+  say('orderResult', 'signing and submitting...');
+  const body = {
+    side: $('orderSide').value,
+    token_id: $('orderToken').value,
+    price: parseFloat($('orderPrice').value),
+    size: parseFloat($('orderSize').value),
+    order_type: $('orderType').value,
+    neg_risk: $('orderNegRisk').value === 'true'
+  };
+  try {
+    const r = await fetch('/api/order', { method: 'POST', headers: J, body: JSON.stringify(body) });
+    say('orderResult', await r.json());
+  } catch (e) { say('orderResult', 'failed: ' + e.message); }
+  loadData();
 }
 
 async function cancelOrder() {
   const id = prompt('Order ID to cancel:');
-  if(!id) return;
-  const r = await fetch('/api/order/'+encodeURIComponent(id)+'/cancel', {method:'POST'});
-  const d = await r.json();
-  document.getElementById('orderResult').textContent = JSON.stringify(d,null,2);
+  if (!id) return;
+  try {
+    const r = await fetch('/api/order/' + encodeURIComponent(id) + '/cancel', { method: 'POST', headers: H });
+    say('orderResult', await r.json());
+  } catch (e) { say('orderResult', 'failed: ' + e.message); }
+  loadData();
 }
 
 async function cancelAllOrders() {
-  if(!confirm('Cancel all orders?')) return;
-  const r = await fetch('/api/orders/cancel-all', {method:'POST'});
-  const d = await r.json();
-  document.getElementById('orderResult').textContent = JSON.stringify(d,null,2);
+  if (!confirm('Cancel every open order?')) return;
+  try {
+    const r = await fetch('/api/orders/cancel-all', { method: 'POST', headers: H });
+    say('orderResult', await r.json());
+  } catch (e) { say('orderResult', 'failed: ' + e.message); }
+  loadData();
+}
+
+function syncStrategyForm() {
+  const s = $('strategySelect').value;
+  $('fCoin').style.display = s === 'none' ? 'none' : 'flex';
+  $('fLevels').style.display = s === 'grid' ? 'flex' : 'none';
+  $('fRange').style.display = s === 'grid' ? 'flex' : 'none';
+  $('fDrop').style.display = s === 'flash_crash' ? 'flex' : 'none';
+  $('fLookback').style.display = s === 'flash_crash' ? 'flex' : 'none';
+  $('fThresh').style.display = s === 'arb' ? 'flex' : 'none';
 }
 
 async function setStrategy() {
-  const s = document.getElementById('strategySelect').value;
-  const cfg = s==='grid' ? {levels:parseInt(document.getElementById('gridLevels').value),
-    range:parseFloat(document.getElementById('gridRange').value)} : {};
-  const r = await fetch('/api/strategy', {method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({strategy:s, config:cfg})});
-  const d = await r.json();
-  alert('Strategy set: '+(d.strategy||'none'));
+  const s = $('strategySelect').value;
+  const cfg = { coin: $('stratCoin').value };
+  if (s === 'grid') { cfg.levels = parseInt($('gridLevels').value, 10); cfg.range = parseFloat($('gridRange').value); }
+  if (s === 'flash_crash') { cfg.drop_threshold = parseFloat($('fcDrop').value); cfg.lookback = parseInt($('fcLookback').value, 10); }
+  if (s === 'arb') { cfg.threshold = parseFloat($('arbThresh').value); }
+  try {
+    const r = await fetch('/api/strategy', { method: 'POST', headers: J, body: JSON.stringify({ strategy: s, config: cfg }) });
+    const d = await r.json();
+    $('strategyNote').textContent = d.message || JSON.stringify(d);
+  } catch (e) { $('strategyNote').textContent = 'failed: ' + e.message; }
+  loadData();
 }
 
-// SSE alerts
-const evtSource = new EventSource('/api/stream');
-evtSource.onmessage = (e) => {
-  const data = JSON.parse(e.data);
-  const log = document.getElementById('alertLog');
-  const div = document.createElement('div');
-  div.className = 'alert '+(data.level||'info');
-  div.textContent = new Date(data.time).toLocaleTimeString()+' ['+data.level+'] '+data.msg;
-  log.prepend(div);
-  while(log.children.length>20) log.removeChild(log.lastChild);
-};
-evtSource.onerror = () => { setTimeout(()=>{evtSource.close();location.reload();},3000); };
+async function loadSystem() {
+  try {
+    const s = await (await fetch('/api/system')).json();
+    $('moduleTable').innerHTML = '<table><thead><tr><th>Path</th><th>Contains</th><th>Role</th></tr></thead><tbody>'
+      + s.modules.map(m => '<tr><td><code>' + m.path + '</code></td><td>' + m.symbols + '</td><td>' + m.purpose + '</td></tr>').join('')
+      + '</tbody></table>';
 
+    $('strategyTable').innerHTML = '<table><thead><tr><th>Name</th><th>What it does</th><th>Risk</th></tr></thead><tbody>'
+      + Object.entries(s.strategies).filter(([k]) => k !== 'none').map(([k, v]) =>
+        '<tr><td><strong>' + v.label + '</strong><br><code>' + (v.module || '') + '</code></td><td>'
+        + v.detail + '<br><span class="chip">' + Object.entries(v.params).map(([a, b]) => a + '=' + b).join(' ') + '</span></td><td>'
+        + v.risk + '</td></tr>').join('')
+      + '</tbody></table>';
+
+    $('envTable').innerHTML = '<table><thead><tr><th>Variable</th><th>Default</th><th>Purpose</th></tr></thead><tbody>'
+      + s.env.map(e => '<tr><td><code>' + e.name + '</code></td><td>' + e.default + '</td><td>' + e.purpose + '</td></tr>').join('')
+      + '</tbody></table>';
+  } catch (e) { /* system panel is optional */ }
+}
+
+const es = new EventSource('/api/stream' + (AUTH ? '?key=' + encodeURIComponent(AUTH) : ''));
+es.onmessage = (e) => {
+  let data; try { data = JSON.parse(e.data); } catch (_) { return; }
+  const log = $('alertLog');
+  if (log.firstElementChild && log.firstElementChild.tagName === 'P') log.innerHTML = '';
+  const div = document.createElement('div');
+  div.className = 'alert ' + (data.level || 'info');
+  div.textContent = (data.time || '') + '  [' + (data.level || 'info') + ']  ' + (data.msg || '');
+  log.prepend(div);
+  while (log.children.length > 25) log.removeChild(log.lastChild);
+};
+es.onerror = () => { $('alertLog').insertAdjacentHTML('afterbegin', '<p class="note">stream reconnecting...</p>'); };
+
+setInterval(loadData, 5000);
+loadData();
+loadSystem();
 loadMarkets();
+syncStrategyForm();
 </script>
 </body>
 </html>
 """
 
 # ============================================================
-# Auth decorator
-# ============================================================
 def require_auth(f):
+    @functools.wraps(f)
     def wrapper(*args, **kwargs):
         if API_KEY:
-            key = request.headers.get("X-API-Key", "")
+            key = request.headers.get("X-API-Key", "") or request.args.get("key", "")
             if key != API_KEY:
                 return jsonify({"error": "unauthorized"}), 401
         return f(*args, **kwargs)
-    wrapper.__name__ = f.__name__
     return wrapper
 
 
@@ -387,7 +614,36 @@ def require_auth(f):
 # ============================================================
 @app.route("/")
 def dashboard():
-    return render_template_string(DASHBOARD_HTML)
+    return Response(DASHBOARD_HTML, mimetype="text/html")
+
+
+@app.route("/api/system")
+def api_system():
+    return jsonify(
+        {
+            "name": "Poly-Tifu",
+            "version": "2",
+            "exchange": "Polymarket CLOB V2",
+            "chain_id": 137,
+            "builder_program": bool(os.environ.get("POLY_BUILDER_CODE")),
+            "auth_required": bool(API_KEY),
+            "modules": [
+                {"path": p, "symbols": s, "purpose": d} for p, s, d in MODULE_MAP
+            ],
+            "strategies": {
+                key: {
+                    "label": v["label"],
+                    "module": v["module"],
+                    "summary": v["summary"],
+                    "detail": v["detail"],
+                    "risk": v["risk"],
+                    "params": v["params"],
+                }
+                for key, v in STRATEGY_CATALOG.items()
+            },
+            "env": [{"name": n, "default": d, "purpose": p} for n, d, p in ENV_VARS],
+        }
+    )
 
 
 @app.route("/api/status")
@@ -407,9 +663,51 @@ def api_status():
             "has_credentials": bot_state["has_credentials"],
             "neg_risk": bot_state["neg_risk"],
             "strategy": bot_state["strategy"],
+            "strategy_running": bot_state["strategy_running"],
+            "strategy_config": bot_state["strategy_config"],
+            "strategy_error": bot_state["strategy_error"],
+            "strategy_detail": STRATEGY_CATALOG.get(bot_state["strategy"], {}),
             "recent_trades": bot_state["recent_trades"][:10],
+            "market": bot_state["market"],
         }
     )
+
+
+@app.route("/api/strategy", methods=["POST"])
+@require_auth
+def api_set_strategy():
+    data = request.get_json(force=True, silent=True) or {}
+    name = str(data.get("strategy", "none")).lower()
+    config = data.get("config", {}) or {}
+
+    if name not in STRATEGY_CATALOG:
+        return jsonify({"success": False, "strategy": name,
+                        "message": f"Unknown strategy. Pick one of: {', '.join(STRATEGY_CATALOG)}"}), 400
+
+    if name == "none":
+        _stop_strategy()
+        _set_strategy({"strategy": "none", "config": {}})
+        return jsonify({"success": True, "strategy": "none", "running": False,
+                        "message": "Strategy stopped."})
+
+    if not bot_state["bot_initialized"] or bot_instance is None:
+        _set_strategy({"strategy": name, "config": config})
+        bot_state["strategy_error"] = (
+            "Selected but NOT running: no wallet credentials, so it cannot place orders. "
+            "Set POLY_PRIVATE_KEY + POLY_SAFE_ADDRESS to arm it."
+        )
+        return jsonify({"success": False, "strategy": name, "running": False,
+                        "message": bot_state["strategy_error"]}), 409
+
+    try:
+        _start_strategy(name, config)
+    except Exception as e:
+        bot_state["strategy_error"] = str(e)
+        return jsonify({"success": False, "strategy": name, "running": False,
+                        "message": str(e)}), 500
+
+    return jsonify({"success": True, "strategy": name, "running": bot_state["strategy_running"],
+                    "config": bot_state["strategy_config"], "message": f"{name} strategy running."})
 
 
 @app.route("/api/order", methods=["POST"])
@@ -478,12 +776,38 @@ def api_cancel_all():
 @app.route("/api/markets")
 @require_auth
 def api_markets():
-    from src.gamma_client import GammaClient
     coin = request.args.get("coin", DEFAULT_COIN).upper()
+    if GAMMA_CLIENT_CLS is None:
+        return jsonify({"error": "Market client unavailable"}), 503
     try:
-        client = GammaClient()
-        market = client.get_current_15m_market(coin)
-        return jsonify(market or {"error": "No market found"})
+        client = GAMMA_CLIENT_CLS()
+        info = client.get_market_info(coin)
+        if not info:
+            return jsonify({"error": f"No active {coin} 15-minute market right now."}), 404
+        raw = info.get("raw", {})
+        token_ids = info.get("token_ids", {})
+        prices = info.get("prices", {})
+        return jsonify(
+            {
+                "coin": coin,
+                "question": info.get("question"),
+                "slug": info.get("slug"),
+                "end_date": info.get("end_date"),
+                "accepting_orders": info.get("accepting_orders"),
+                "best_bid": info.get("best_bid"),
+                "best_ask": info.get("best_ask"),
+                "spread": info.get("spread"),
+                "volume": raw.get("volume"),
+                "liquidity": raw.get("liquidity"),
+                "condition_id": raw.get("conditionId"),
+                "up": {"id": token_ids.get("up"), "price": prices.get("up"),
+                       "last_trade": raw.get("lastTradePrice")},
+                "down": {"id": token_ids.get("down"), "price": prices.get("down"),
+                         "last_trade": raw.get("lastTradePrice")},
+            }
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -508,13 +832,40 @@ def api_trades():
 @require_auth
 def api_stream():
     def generate():
-        last_price = None
+        last_price = bot_state["last_price"]
+        last_status = bot_state["status"]
+        sent_alerts = 0
         while running:
-            yield f"data: {json.dumps({'time': time.strftime('%H:%M:%S'), 'price': bot_state['last_price'], 'status': bot_state['status'], 'level': 'info', 'msg': f'price={bot_state['last_price']} status={bot_state['status']}'})}\n\n"
-            for alert in bot_state.get("alerts", []):
-                yield f"data: {json.dumps(alert)}\n\n"
+            price = bot_state["last_price"]
+            status = bot_state["status"]
+            alerts = bot_state["alerts"]
+            frame = {
+                "time": time.strftime("%H:%M:%S"),
+                "price": price,
+                "status": status,
+                "strategy": bot_state["strategy"],
+                "level": "info",
+                "msg": "price={} status={} strategy={}".format(price, status, bot_state["strategy"]),
+            }
+            if price != last_price or status != last_status:
+                frame["level"] = "warn" if status == "error" else "info"
+            last_price = price
+            last_status = status
+            yield f"data: {json.dumps(frame)}\n\n"
+
+            if len(alerts) > sent_alerts:
+                for alert in alerts[sent_alerts:]:
+                    yield f"data: {json.dumps(alert)}\n\n"
+                sent_alerts = len(alerts)
+            elif len(alerts) < sent_alerts:
+                sent_alerts = len(alerts)
+
             time.sleep(5)
-    return Response(generate(), mimetype="text/event-stream")
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 @app.route("/health")
@@ -530,11 +881,16 @@ def _try_start_bot_loop():
     try:
         from dotenv import load_dotenv
         load_dotenv()
+
+        bot_loop_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(bot_loop_loop)
+        threading.Thread(target=_market_loop, daemon=True, name="market-loop").start()
+
         from scripts.run_bot import check_env_mode, load_config_from_env, get_private_key_from_env
         from src.bot import TradingBot
 
         if not check_env_mode():
-            print("[web_dashboard] No credentials -- info-only mode")
+            print("[web_dashboard] No credentials -- read-only mode")
             bot_state["status"] = "idle"
             return
 
@@ -548,13 +904,48 @@ def _try_start_bot_loop():
         bot_state["status"] = "running"
         print("[web_dashboard] Bot initialized")
 
-        bot_loop_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(bot_loop_loop)
         bot_loop_loop.run_until_complete(_bot_loop(bot))
     except Exception as e:
         bot_state["status"] = "error"
         bot_state["errors"].append({"time": time.strftime("%H:%M:%S"), "error": f"Bot init failed: {e}"})
         print(f"[web_dashboard] Bot not started: {e}")
+
+
+def _market_loop():
+    """Polls the public 15-minute market. Runs with or without credentials."""
+    asyncio.run(_market_loop_async())
+
+
+async def _market_loop_async():
+    coin = DEFAULT_COIN
+    client_cls = GAMMA_CLIENT_CLS
+    if client_cls is None:
+        return
+    while running:
+        try:
+            def _fetch():
+                return client_cls().get_market_info(coin)
+
+            info = await asyncio.to_thread(_fetch)
+            if info:
+                prices = info.get("prices", {})
+                up = prices.get("up")
+                bot_state["last_price"] = str(up) if up is not None else None
+                bot_state["market"] = {
+                    "coin": coin,
+                    "question": info.get("question"),
+                    "slug": info.get("slug"),
+                    "end_date": info.get("end_date"),
+                    "up_price": up,
+                    "down_price": prices.get("down"),
+                    "best_bid": info.get("best_bid"),
+                    "best_ask": info.get("best_ask"),
+                }
+        except Exception as e:
+            bot_state["errors"].append({"time": time.strftime("%H:%M:%S"), "error": f"Market poll: {e}"})
+            if len(bot_state["errors"]) > 50:
+                bot_state["errors"] = bot_state["errors"][-50:]
+        await asyncio.sleep(10)
 
 
 async def _bot_loop(bot):
@@ -572,8 +963,7 @@ async def _bot_loop(bot):
                     bot_state["last_price"] = str(price)
             try:
                 orders = await bot.get_open_orders()
-                if orders:
-                    bot_state["open_orders"] = orders[:20]
+                bot_state["open_orders"] = (orders or [])[:20]
             except Exception:
                 pass
             try:
@@ -599,15 +989,131 @@ async def _bot_loop(bot):
     bot_state["status"] = "stopped"
 
 
+def _push_alert(msg, level="info"):
+    with strategy_lock:
+        bot_state["alerts"].insert(0, {"time": time.strftime("%H:%M:%S"), "level": level, "msg": msg})
+        bot_state["alerts"] = bot_state["alerts"][:20]
+        bot_state["errors"].append({"time": time.strftime("%H:%M:%S"), "error": msg})
+        if len(bot_state["errors"]) > 50:
+            bot_state["errors"] = bot_state["errors"][-50:]
+
+
 def _set_strategy(cfg):
     strategy = cfg.get("strategy", "none")
     bot_state["strategy"] = strategy
-    bot_state["alerts"].insert(0, {
-        "time": time.strftime("%H:%M:%S"),
-        "level": "info",
-        "msg": f"Strategy set to {strategy}",
-    })
-    bot_state["alerts"] = bot_state["alerts"][:20]
+    bot_state["strategy_config"] = cfg.get("config", {})
+    if strategy != "none":
+        _push_alert("Strategy set to {}".format(strategy))
+
+
+def _ensure_strategy_loop():
+    global strategy_loop
+    if strategy_loop is not None:
+        return strategy_loop
+    ready = threading.Event()
+
+    def _runner():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        global strategy_loop
+        strategy_loop = loop
+        ready.set()
+        loop.run_forever()
+
+    threading.Thread(target=_runner, daemon=True, name="strategy-loop").start()
+    if not ready.wait(timeout=5):
+        raise RuntimeError("Strategy event loop failed to start")
+    return strategy_loop
+
+
+def _stop_strategy():
+    global strategy_instance, strategy_task
+    with strategy_lock:
+        instance, task = strategy_instance, strategy_task
+        strategy_instance, strategy_task = None, None
+        bot_state["strategy_running"] = False
+
+    if instance is not None:
+        try:
+            instance.running = False
+        except Exception:
+            pass
+        _push_alert("Strategy stopped.", "info")
+
+    if task is not None and strategy_loop is not None:
+        try:
+            strategy_loop.call_soon_threadsafe(task.cancel)
+        except Exception:
+            pass
+
+
+def _build_strategy(name, config):
+    config = dict(config or {})
+    coin = str(config.pop("coin", DEFAULT_COIN)).upper()
+
+    if name == "grid":
+        from strategies.grid import GridStrategy, GridConfig
+        cfg = GridConfig(
+            coin=coin,
+            levels=int(config.get("levels", 5)),
+            range_pct=float(config.get("range", config.get("range_pct", 2.0))),
+            size=float(config.get("size", 10.0)),
+        )
+        return GridStrategy(bot=bot_instance, config=cfg)
+
+    if name == "flash_crash":
+        from strategies.flash_crash import FlashCrashStrategy, FlashCrashConfig
+        cfg = FlashCrashConfig(
+            coin=coin,
+            size=float(config.get("size", 5.0)),
+            drop_threshold=float(config.get("drop_threshold", 0.30)),
+            price_lookback_seconds=int(config.get("lookback", 10)),
+            take_profit=float(config.get("take_profit", 0.10)),
+            stop_loss=float(config.get("stop_loss", 0.05)),
+        )
+        return FlashCrashStrategy(bot=bot_instance, config=cfg)
+
+    if name == "arb":
+        from strategies.arb import ArbStrategy, ArbConfig
+        cfg = ArbConfig(
+            coin=coin,
+            threshold=float(config.get("threshold", 0.05)),
+            size=float(config.get("size", 5.0)),
+        )
+        return ArbStrategy(bot=bot_instance, config=cfg)
+
+    raise ValueError("Unknown strategy: {}".format(name))
+
+
+def _start_strategy(name, config):
+    global strategy_instance, strategy_task
+
+    _stop_strategy()
+    loop = _ensure_strategy_loop()
+    instance = _build_strategy(name, config)
+
+    with strategy_lock:
+        strategy_instance = instance
+        bot_state["strategy"] = name
+        bot_state["strategy_config"] = dict(config or {})
+        bot_state["strategy_error"] = None
+        bot_state["strategy_running"] = True
+
+    def _runner():
+        async def _main():
+            try:
+                await instance.run()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                bot_state["strategy_running"] = False
+                bot_state["strategy_error"] = str(e)
+                _push_alert("Strategy {} crashed: {}".format(name, e), "error")
+
+        loop.run_until_complete(_main())
+
+    threading.Thread(target=_runner, daemon=True, name="strategy-{}".format(name)).start()
+    _push_alert("Strategy {} started.".format(name), "info")
 
 
 def main():
@@ -624,6 +1130,8 @@ def main():
     # Strip em dashes from HTML for Python 3 compat
     global DASHBOARD_HTML
     DASHBOARD_HTML = DASHBOARD_HTML.replace("\u2014", "--")
+
+    _warm_imports()
 
     bot_thread = threading.Thread(target=_try_start_bot_loop, daemon=True)
     bot_thread.start()

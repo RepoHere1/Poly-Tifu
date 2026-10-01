@@ -61,6 +61,7 @@ GAMMA_CLIENT_CLS = None
 
 paper_instance = None
 TRADING_MODE = "live"
+_previous_token_ids = None
 
 
 def _warm_imports():
@@ -1148,10 +1149,12 @@ def _market_loop():
 
 
 async def _market_loop_async():
+    global _previous_token_ids
     coin = DEFAULT_COIN
     client_cls = GAMMA_CLIENT_CLS
     if client_cls is None:
         return
+    current_slug = None
     while running:
         try:
             def _fetch():
@@ -1163,10 +1166,11 @@ async def _market_loop_async():
                 up = prices.get("up")
                 bot_state["last_price"] = str(up) if up is not None else None
                 token_ids = info.get("token_ids", {})
+                slug = info.get("slug")
                 bot_state["market"] = {
                     "coin": coin,
                     "question": info.get("question"),
-                    "slug": info.get("slug"),
+                    "slug": slug,
                     "end_date": info.get("end_date"),
                     "up_price": up,
                     "down_price": prices.get("down"),
@@ -1176,6 +1180,20 @@ async def _market_loop_async():
                 }
 
                 if paper_instance is not None and token_ids:
+                    if current_slug and slug and slug != current_slug:
+                        stale = _previous_token_ids
+                        if stale:
+                            res = paper_instance.expire_market(stale)
+                            _push_alert(
+                                "Market rolled {}: paper cancelled {} order(s), settled {} position(s).".format(
+                                    slug, res["cancelled"], res["settled"]
+                                ),
+                                "info",
+                            )
+                        _previous_token_ids = None
+
+                    _previous_token_ids = token_ids
+                    current_slug = slug
                     await _settle_paper(token_ids)
 
         except Exception as e:

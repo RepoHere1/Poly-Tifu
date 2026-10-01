@@ -218,25 +218,32 @@ class PaperTradingBot(ThreadLocalSessionMixin):
     @staticmethod
     def top_of_book(book: Dict[str, Any]) -> Dict[str, Optional[float]]:
         """
-        Extract best bid and best ask from a CLOB book.
+        Extract best bid, best ask and the size resting at each, from a CLOB book.
 
         Polymarket returns each side sorted worst-price-first, so the tightest
-        level is the LAST element, not the first.
+        level is the LAST entry, not the first. Size at that level matters:
+        without it a 100-share order would "fill" against a 3-share level.
         """
         def best(levels, reverse):
-            vals = []
+            best_price = None
+            best_size = 0.0
             for lv in levels or []:
                 try:
-                    vals.append(float(lv["price"]))
+                    price = float(lv["price"])
+                    size = float(lv.get("size", 0) or 0)
                 except Exception:
                     continue
-            if not vals:
-                return None
-            return min(vals) if reverse else max(vals)
+                if best_price is None or (price < best_price if reverse else price > best_price):
+                    best_price, best_size = price, size
+            return best_price, best_size
 
+        bid, bid_size = best(book.get("bids"), reverse=False)
+        ask, ask_size = best(book.get("asks"), reverse=True)
         return {
-            "bid": best(book.get("bids"), reverse=False),
-            "ask": best(book.get("asks"), reverse=True),
+            "bid": bid,
+            "ask": ask,
+            "bid_size": bid_size,
+            "ask_size": ask_size,
         }
 
     # ============================================================
@@ -244,10 +251,14 @@ class PaperTradingBot(ThreadLocalSessionMixin):
     # ============================================================
     def settle(self, books: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Fill resting orders whose price the real book has crossed.
+        Fill resting orders that the real book has crossed, size permitting.
+
+        A fill only happens for as much size as is actually resting at the
+        crossing level, so the simulator cannot report fills that the live
+        book could not have produced.
 
         Args:
-            books: {token_id: {"bid": float|None, "ask": float|None}}
+            books: {token_id: {"bid","ask","bid_size","ask_size"}}
 
         Returns:
             List of fill events that happened on this pass.
@@ -265,65 +276,160 @@ class PaperTradingBot(ThreadLocalSessionMixin):
                 order = self.orders.get(oid)
                 if not order or order.get("status") != "live":
                     continue
+
                 quote = books.get(order["token_id"]) or {}
                 bid, ask = quote.get("bid"), quote.get("ask")
 
-                crossed = False
-                if order["side"] == "BUY" and ask is not None and float(ask) <= float(order["price"]):
-                    crossed = True
-                elif order["side"] == "SELL" and bid is not None and float(bid) >= float(order["price"]):
-                    crossed = True
+                remaining = round(
+                    self._order_size(order) - float(order.get("size_matched", 0) or 0), 6
+                )
+                if remaining <= 1e-9:
+                    self.orders.pop(oid, None)
+                    continue
 
-                if crossed:
-                    fills.append(self._fill(oid))
+                fill_price = None
+                available = 0.0
+                if (
+                    order["side"] == "BUY"
+                    and ask is not None
+                    and float(ask) <= float(order["price"])
+                ):
+                    fill_price = float(order["price"])
+                    available = float(quote.get("ask_size") or 0.0)
+                elif (
+                    order["side"] == "SELL"
+                    and bid is not None
+                    and float(bid) >= float(order["price"])
+                ):
+                    fill_price = float(order["price"])
+                    available = float(quote.get("bid_size") or 0.0)
+
+                if fill_price is None or available <= 0:
+                    continue
+
+                fill_size = min(remaining, available)
+                if fill_size <= 1e-9:
+                    continue
+
+                fills.append(self._apply_fill(oid, fill_size, fill_price))
 
             if fills:
                 self._trim()
                 self._dirty = True
         return fills
 
-    def _fill(self, order_id: str) -> Dict[str, Any]:
-        """Execute a resting order against the simulated account."""
-        order = self.orders.pop(order_id)
-        price = float(order["price"])
+    def _apply_fill(self, order_id: str, fill_size: float, fill_price: float) -> Dict[str, Any]:
+        """Apply a fill of fill_size at fill_price, allowing partial fills."""
+        order = self.orders[order_id]
         size = self._order_size(order)
         token_id = order["token_id"]
-        notional = round(price * size, 6)
+        notional = round(fill_price * fill_size, 6)
 
         pos = self.positions.setdefault(token_id, {"size": 0.0, "cost": 0.0})
 
         if order["side"] == "BUY":
             self.cash = round(self.cash - notional, 6)
-            pos["size"] = round(pos["size"] + size, 6)
+            pos["size"] = round(pos["size"] + fill_size, 6)
             pos["cost"] = round(pos["cost"] + notional, 6)
         else:
-            avg = pos["cost"] / pos["size"] if pos["size"] > 0 else price
+            avg = pos["cost"] / pos["size"] if pos["size"] > 0 else fill_price
             self.cash = round(self.cash + notional, 6)
-            self.realized_pnl = round(self.realized_pnl + (price - avg) * size, 6)
-            pos["size"] = round(pos["size"] - size, 6)
-            pos["cost"] = round(pos["cost"] - avg * size, 6)
+            self.realized_pnl = round(self.realized_pnl + (fill_price - avg) * fill_size, 6)
+            pos["size"] = round(pos["size"] - fill_size, 6)
+            pos["cost"] = round(pos["cost"] - avg * fill_size, 6)
             if pos["size"] <= 1e-9:
                 pos["size"] = 0.0
                 pos["cost"] = 0.0
 
+        matched = round(float(order.get("size_matched", 0) or 0) + fill_size, 6)
+        order["size_matched"] = matched
         self.fills += 1
+
         trade = {
             "id": f"paper-{uuid.uuid4().hex[:16]}",
             "order_id": order_id,
             "created_at": self._now(),
             "timestamp": self._now(),
             "side": order["side"],
-            "price": price,
-            "size": size,
+            "price": fill_price,
+            "size": fill_size,
             "token_id": token_id,
             "status": "MATCHED",
             "simulated": True,
             "notional": notional,
         }
         self.trades.append(trade)
-        order["status"] = "matched"
-        order["filled_at"] = self._now()
+
+        if matched >= size - 1e-9:
+            self.orders.pop(order_id, None)
+            order["status"] = "matched"
+            order["filled_at"] = self._now()
+
         return trade
+
+    def expire_market(self, token_ids) -> Dict[str, int]:
+        """
+        Cancel resting orders on markets that have rolled over.
+
+        The exchange cancels orders when a market closes, so the simulator must
+        too, otherwise stale orders pile up forever and keep cash reserved.
+        Positions in expired markets are settled at their last real mark.
+
+        Args:
+            token_ids: Token IDs of the expired market
+
+        Returns:
+            Counts of cancelled orders and settled positions
+        """
+        tokens = {t for t in (token_ids or []) if t}
+        if not tokens:
+            return {"cancelled": 0, "settled": 0}
+
+        cancelled = 0
+        settled = 0
+        with self._lock:
+            for oid in [
+                o for o, v in self.orders.items() if v.get("token_id") in tokens
+            ]:
+                self.orders.pop(oid, None)
+                cancelled += 1
+
+            for token_id in list(tokens):
+                pos = self.positions.get(token_id)
+                if not pos or pos["size"] <= 1e-9:
+                    continue
+                mark = self.last_marks.get(token_id, 0.0)
+                proceeds = round(pos["size"] * mark, 6)
+                avg = pos["cost"] / pos["size"] if pos["size"] else 0.0
+                self.cash = round(self.cash + proceeds, 6)
+                self.realized_pnl = round(
+                    self.realized_pnl + (mark - avg) * pos["size"], 6
+                )
+                self.trades.append(
+                    {
+                        "id": f"paper-{uuid.uuid4().hex[:16]}",
+                        "order_id": None,
+                        "created_at": self._now(),
+                        "timestamp": self._now(),
+                        "side": "SETTLE",
+                        "price": mark,
+                        "size": pos["size"],
+                        "token_id": token_id,
+                        "status": "EXPIRED",
+                        "simulated": True,
+                        "notional": proceeds,
+                    }
+                )
+                self.fills += 1
+                pos["size"] = 0.0
+                pos["cost"] = 0.0
+                settled += 1
+
+            if cancelled or settled:
+                self._trim()
+                self._dirty = True
+
+        return {"cancelled": cancelled, "settled": settled}
 
     def _trim(self) -> None:
         if len(self.trades) > 500:

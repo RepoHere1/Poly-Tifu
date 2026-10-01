@@ -27,6 +27,7 @@ app.config["PREFERRED_URL_SCHEME"] = "https"
 
 API_KEY = os.environ.get("POLY_DASHBOARD_KEY", "")
 DEFAULT_COIN = os.environ.get("POLY_DEFAULT_COIN", "BTC")
+PAPER_SETTLE_INTERVAL = float(os.environ.get("POLY_PAPER_SETTLE_INTERVAL", "10"))
 
 bot_state = {
     "status": "idle",
@@ -53,10 +54,13 @@ bot_instance = None
 bot_loop_loop = None
 
 strategy_instance = None
-strategy_task = None
+strategy_future = None
 strategy_loop = None
 strategy_lock = threading.Lock()
 GAMMA_CLIENT_CLS = None
+
+paper_instance = None
+TRADING_MODE = "live"
 
 
 def _warm_imports():
@@ -66,13 +70,29 @@ def _warm_imports():
     Letting two worker threads trigger those imports at once deadlocks on the
     per-module import locks, so it is done up front and serialized.
     """
-    global GAMMA_CLIENT_CLS
+    global GAMMA_CLIENT_CLS, paper_instance
     try:
         from src.gamma_client import GammaClient
         GAMMA_CLIENT_CLS = GammaClient
         print("[web_dashboard] src package imported")
     except Exception as e:
         print(f"[web_dashboard] src import failed, market polling disabled: {e}")
+        return
+    try:
+        from src.paper_bot import PaperTradingBot
+
+        paper_instance = PaperTradingBot(
+            starting_cash=float(os.environ.get("POLY_PAPER_CASH", "350"))
+        )
+        threading.Thread(
+            target=paper_instance.start_autosave, daemon=True, name="paper-autosave"
+        ).start()
+        print(
+            f"[web_dashboard] Paper engine ready "
+            f"(cash ${paper_instance.starting_cash:.2f}, state {paper_instance.state_path})"
+        )
+    except Exception as e:
+        print(f"[web_dashboard] Paper engine failed to start: {e}")
 
 STRATEGY_CATALOG = {
     "none": {
@@ -238,13 +258,45 @@ details { border-top:1px solid var(--border); padding:.6rem 0; }
 summary { cursor:pointer; font-size:.88rem; color:#fff; font-weight:600; }
 footer { margin-top:2rem; text-align:center; color:var(--muted); font-size:.75rem; }
 .note { font-size:.78rem; color:var(--muted); margin-top:.5rem; line-height:1.5; }
+.masthead { display:flex; justify-content:space-between; align-items:flex-start;
+            gap:1.25rem; flex-wrap:nowrap; margin-bottom:1rem; }
+.masthead > div:first-child { flex:1 1 auto; min-width:0; }
+.masthead h1 { margin-bottom:.25rem; }
+.subtitle { color:var(--muted); margin-bottom:0; font-size:.9rem; }
+.mode-toggle { display:flex; align-items:center; gap:.6rem; background:var(--card);
+   border:1px solid var(--border); border-radius:12px; padding:.7rem .9rem;
+   flex:0 0 auto; margin-left:auto; }
+.mode-toggle .lbl { font-size:.7rem; color:var(--muted); text-transform:uppercase;
+   letter-spacing:.05em; }
+.mode-btn { display:flex; align-items:center; gap:.45rem; border:none; cursor:pointer;
+   padding:.5rem .95rem; border-radius:9px; font-weight:700; font-size:.8rem;
+   letter-spacing:.04em; transition:opacity .15s; }
+.mode-btn:hover { opacity:.85; }
+.mode-btn.live { background:#450a0a; color:#fca5a5; }
+.mode-btn.live.on { background:var(--red); color:#fff; }
+.mode-btn.dry { background:#064e3b; color:#86efac; }
+.mode-btn.dry.on { background:var(--green); color:#04231a; }
+.mode-btn:disabled { opacity:.35; cursor:not-allowed; }
+.mode-state { font-size:.68rem; color:var(--muted); margin-top:.35rem; text-align:right; }
 </style>
 </head>
 <body>
 <div class="container">
 
-<h1>Poly-Tifu</h1>
-<p class="subtitle">Automated trading bot for Polymarket 15-minute crypto Up/Down markets &middot; CLOB V2 &middot; EIP-712 &middot; optional gasless</p>
+<div class="masthead">
+  <div>
+    <h1>Poly-Tifu</h1>
+    <p class="subtitle">Automated trading bot for Polymarket 15-minute crypto Up/Down markets &middot; CLOB V2 &middot; EIP-712 &middot; optional gasless</p>
+  </div>
+  <div class="mode-toggle">
+    <div>
+      <div class="lbl">Trading mode</div>
+      <div class="mode-state" id="modeState">connecting...</div>
+    </div>
+    <button class="mode-btn dry" id="btnDry" onclick="setMode('dry')">DRY &middot; simulated</button>
+    <button class="mode-btn live" id="btnLive" onclick="setMode('live')">LIVE &middot; real money</button>
+  </div>
+</div>
 
 <div id="modeBanner" class="banner live">Checking credentials...</div>
 
@@ -263,8 +315,9 @@ footer { margin-top:2rem; text-align:center; color:var(--muted); font-size:.75re
   <p>A share's price between $0 and $1 <strong>is</strong> the crowd's live estimate of that chance. Buy at $0.45 and the outcome resolving your way turns it into $1.00; the other way it is worth nothing. So the entire game is buying outcomes that are mispriced relative to real information.</p>
   <p>Poly-Tifu is the machine that watches for those mispricings and acts on them. It keeps a live WebSocket feed of both orderbooks, computes mid-prices and short-window volatility, and runs a trading strategy that places and cancels real limit orders on the Polymarket CLOB.</p>
   <p><strong>Where the edge comes from:</strong> these markets expire every 15 minutes and are thin, so orderbooks routinely lag, cross, and gap right before a boundary. A strategy that reacts faster than a human clicking in a browser can capture part of that.</p>
-  <p><strong>The two halves:</strong> reading market data is free and public (Gamma API + WebSocket, no credentials). Placing orders requires your wallet &mdash; a private key and your Polymarket Safe address &mdash; and moves real USDC. Without those this whole page runs read-only and every trade button is disabled.</p>
-  <p><strong>Not financial advice.</strong> These are short-dated binary bets on an asset price, the books are thin, and most retail attempts lose money. Run it small.</p>
+  <p><strong>The two halves:</strong> reading market data is free and public (Gamma API + WebSocket, no credentials). Placing orders requires your wallet &mdash; a private key and your Polymarket Safe address &mdash; and moves real USDC.</p>
+  <p><strong>DRY and LIVE:</strong> the toggle at the top right switches where orders go. <strong>DRY</strong> routes them to a simulator that starts with $350 of fake cash and fills your orders against the <em>real</em> Polymarket order book, so you can watch exactly how a strategy behaves without risking anything &mdash; and it keeps that balance across restarts. <strong>LIVE</strong> routes the identical orders to the real CLOB with your real wallet. Market data is real and identical in both modes; only the money is fake.</p>
+  <p><strong>Not financial advice.</strong> These are short-dated binary bets on an asset price, the books are thin, and most retail attempts lose money. Run it small, and get comfortable in DRY first.</p>
 </div>
 
 <div class="card">
@@ -343,8 +396,12 @@ footer { margin-top:2rem; text-align:center; color:var(--muted); font-size:.75re
 </div>
 
 <div class="card">
-  <h2 class="sec">Balance</h2>
-  <pre class="out" id="balance">unavailable without credentials</pre>
+  <h2 class="sec">Balance &amp; simulated account</h2>
+  <div class="form-row" style="margin-bottom:.6rem">
+    <button class="btn ghost" onclick="resetPaper()">Reset simulated account</button>
+    <span class="note" style="margin:0">Only affects DRY mode. The simulated balance, positions, resting orders and fills persist across restarts and redeploys.</span>
+  </div>
+  <pre class="out" id="balance">no balance yet</pre>
 </div>
 
 <div class="card">
@@ -427,10 +484,25 @@ async function loadData() {
     $('strategyVal').className = 'stat-value ' + (d.strategy_running ? 'green' : 'purple');
 
     const armed = d.has_credentials;
-    $('modeBanner').className = 'banner ' + (armed ? 'armed' : 'live');
-    $('modeBanner').innerHTML = armed
-      ? '<b>ARMED &mdash; real money.</b> Wallet credentials are loaded, so this bot can place, match, and lose real USDC. Strategies you start below will trade live.'
-      : '<b>READ-ONLY.</b> No <span class="mono">POLY_PRIVATE_KEY</span> / <span class="mono">POLY_SAFE_ADDRESS</span>, so market data is live but no orders can be signed or sent. Trading controls are disabled.';
+    const mode = d.mode || 'dry';
+    $('btnDry').classList.toggle('on', mode === 'dry');
+    $('btnLive').classList.toggle('on', mode === 'live');
+    $('btnLive').disabled = !armed;
+    $('btnLive').title = armed ? 'Place real orders' : 'No wallet credentials loaded';
+    $('modeState').textContent = mode === 'live'
+      ? 'LIVE orders -- real USDC'
+      : 'DRY orders -- simulated, ' + (d.paper ? ('$' + Number(d.paper.starting_cash).toFixed(0)) : '');
+
+    if (mode === 'live') {
+      $('modeBanner').className = 'banner armed';
+      $('modeBanner').innerHTML = '<b>LIVE -- real money.</b> Orders are signed with your wallet and sent to the Polymarket CLOB. Strategies you start below trade real USDC.';
+    } else if (armed) {
+      $('modeBanner').className = 'banner live';
+      $('modeBanner').innerHTML = '<b>DRY -- simulated.</b> Wallet credentials are loaded, so you can switch to LIVE at any time. Orders placed now are simulated against real market data and cost nothing. Starting cash $' + (d.paper ? Number(d.paper.starting_cash).toFixed(2) : '350') + '.';
+    } else {
+      $('modeBanner').className = 'banner live';
+      $('modeBanner').innerHTML = '<b>DRY -- read-only.</b> No <span class="mono">POLY_PRIVATE_KEY</span> / <span class="mono">POLY_SAFE_ADDRESS</span>, so LIVE is unavailable and orders are simulated against real market data with a fake balance.';
+    }
     ['btnPlace', 'btnCancel', 'btnCancelAll'].forEach(b => { if ($(b)) $(b).disabled = !armed; });
 
     $('openOrdersTable').innerHTML = (d.open_orders && d.open_orders.length)
@@ -447,7 +519,7 @@ async function loadData() {
         + (t.price ?? '-') + '</td><td>' + (t.size ?? '-') + '</td></tr>').join('') + '</tbody></table>'
       : '<p class="note">none</p>';
 
-    say('balance', d.balance ? d.balance : 'unavailable without credentials');
+    say('balance', d.balance ? d.balance : 'no balance yet');
 
     const act = d.recent_activity || [];
     say('activity', act.length ? act.map(e => (e.time || '') + '  ' + (e.error || '')).join(String.fromCharCode(10)) : 'no activity yet');
@@ -457,6 +529,34 @@ async function loadData() {
       ? (d.strategy + ': ' + det.summary + (d.strategy_error ? ' -- ' + d.strategy_error : (d.strategy_running ? ' -- running.' : ' -- selected, not running.')))
       : 'No strategy running.';
   } catch (e) { say('activity', 'status fetch failed: ' + e.message); }
+}
+
+async function setMode(mode) {
+  const btn = mode === 'live' ? $('btnLive') : $('btnDry');
+  if (mode === 'live') {
+    const msg = 'LIVE mode places REAL orders with real USDC.'
+      + String.fromCharCode(10) + String.fromCharCode(10)
+      + 'Are you sure?';
+    if (!confirm(msg)) return;
+  }
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/mode', { method: 'POST', headers: J, body: JSON.stringify({ mode }) });
+    const d = await r.json();
+    if (!r.ok || !d.success) alert(d.message || 'mode switch failed');
+  } catch (e) { alert('mode switch failed: ' + e.message); }
+  btn.disabled = false;
+  loadData();
+}
+
+async function resetPaper() {
+  if (!confirm('Reset the simulated account back to its starting cash?')) return;
+  try {
+    const r = await fetch('/api/paper/reset', { method: 'POST', headers: H });
+    const d = await r.json();
+    if (!r.ok) alert(d.message || 'reset failed');
+  } catch (e) { alert('reset failed: ' + e.message); }
+  loadData();
 }
 
 async function loadMarkets() {
@@ -610,6 +710,71 @@ def require_auth(f):
 
 
 # ============================================================
+# Trading engine facade
+# ============================================================
+MODE_FILE_ENV = "POLY_TRADING_MODE"
+_mode_lock = threading.Lock()
+
+
+def _mode_state_path() -> Path:
+    explicit = os.environ.get("POLY_PAPER_STATE")
+    if explicit:
+        return Path(explicit).with_name("trading_mode.json")
+    mount = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+    if mount:
+        return Path(mount) / "trading_mode.json"
+    return Path(__file__).parent / "data" / "trading_mode.json"
+
+
+def _load_mode() -> str:
+    default = os.environ.get(MODE_FILE_ENV, "live").lower()
+    if default not in ("live", "dry"):
+        default = "live"
+    try:
+        path = _mode_state_path()
+        if path.exists():
+            saved = json.loads(path.read_text(encoding="utf-8")).get("mode")
+            if saved in ("live", "dry"):
+                return saved
+    except Exception:
+        pass
+    return default
+
+
+def _save_mode(mode: str) -> None:
+    try:
+        path = _mode_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps({"mode": mode}), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def active_bot():
+    """
+    Return the engine that should service the next order.
+
+    DRY mode routes to the paper simulator, LIVE mode to the real CLOB bot.
+    Falls back to paper if the live bot is missing or uninitialized, so the
+    page never silently pretends to trade for real when it cannot.
+    """
+    with _mode_lock:
+        if TRADING_MODE == "live" and bot_instance is not None and bot_state["bot_initialized"]:
+            return bot_instance
+        return paper_instance
+
+
+def active_mode() -> str:
+    """Return 'live' only when a real, initialized bot is actually serving."""
+    with _mode_lock:
+        if TRADING_MODE == "live" and bot_instance is not None and bot_state["bot_initialized"]:
+            return "live"
+        return "dry"
+
+
+# ============================================================
 # Routes
 # ============================================================
 @app.route("/")
@@ -649,6 +814,14 @@ def api_system():
 @app.route("/api/status")
 @require_auth
 def api_status():
+    if active_bot() is paper_instance:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_refresh_engine_state())
+        except Exception:
+            pass
+        finally:
+            loop.close()
     return jsonify(
         {
             "status": bot_state["status"],
@@ -669,6 +842,13 @@ def api_status():
             "strategy_detail": STRATEGY_CATALOG.get(bot_state["strategy"], {}),
             "recent_trades": bot_state["recent_trades"][:10],
             "market": bot_state["market"],
+            "mode": active_mode(),
+            "requested_mode": TRADING_MODE,
+            "live_available": bool(bot_state["bot_initialized"]),
+            "paper": {
+                "starting_cash": paper_instance.starting_cash if paper_instance else None,
+                "state_path": str(paper_instance.state_path) if paper_instance else None,
+            },
         }
     )
 
@@ -690,12 +870,9 @@ def api_set_strategy():
         return jsonify({"success": True, "strategy": "none", "running": False,
                         "message": "Strategy stopped."})
 
-    if not bot_state["bot_initialized"] or bot_instance is None:
+    if active_bot() is None:
         _set_strategy({"strategy": name, "config": config})
-        bot_state["strategy_error"] = (
-            "Selected but NOT running: no wallet credentials, so it cannot place orders. "
-            "Set POLY_PRIVATE_KEY + POLY_SAFE_ADDRESS to arm it."
-        )
+        bot_state["strategy_error"] = "Selected but NOT running: no trading engine available."
         return jsonify({"success": False, "strategy": name, "running": False,
                         "message": bot_state["strategy_error"]}), 409
 
@@ -710,12 +887,61 @@ def api_set_strategy():
                     "config": bot_state["strategy_config"], "message": f"{name} strategy running."})
 
 
+@app.route("/api/mode", methods=["POST"])
+@require_auth
+def api_set_mode():
+    """Switch between LIVE (real orders) and DRY (simulated orders)."""
+    global TRADING_MODE
+    data = request.get_json(force=True, silent=True) or {}
+    requested = str(data.get("mode", "")).lower()
+    if requested not in ("live", "dry"):
+        return jsonify({"success": False, "message": "mode must be 'live' or 'dry'"}), 400
+
+    if requested == "live" and not bot_state["bot_initialized"]:
+        return jsonify(
+            {
+                "success": False,
+                "mode": active_mode(),
+                "message": (
+                    "Cannot go LIVE: no wallet credentials are loaded, so real orders "
+                    "cannot be signed. Set POLY_PRIVATE_KEY and POLY_SAFE_ADDRESS."
+                ),
+            }
+        ), 409
+
+    with _mode_lock:
+        TRADING_MODE = requested
+    _save_mode(requested)
+    _push_alert(f"Mode switched to {requested.upper()}.", "warn")
+
+    return jsonify(
+        {
+            "success": True,
+            "mode": active_mode(),
+            "requested": requested,
+            "paper_cash": paper_instance.starting_cash if paper_instance else None,
+        }
+    )
+
+
+@app.route("/api/paper/reset", methods=["POST"])
+@require_auth
+def api_paper_reset():
+    """Reset the simulated account back to its starting balance."""
+    if paper_instance is None:
+        return jsonify({"success": False, "message": "Paper engine unavailable"}), 503
+    paper_instance.reset()
+    _push_alert("Paper account reset to starting cash.", "warn")
+    return jsonify({"success": True, "cash": paper_instance.cash})
+
+
 @app.route("/api/order", methods=["POST"])
 @require_auth
 def api_place_order():
     data = request.get_json(force=True, silent=True) or {}
-    if not bot_instance or not bot_state["bot_initialized"]:
-        return jsonify({"success": False, "message": "Bot not initialized"}), 400
+    bot = active_bot()
+    if bot is None:
+        return jsonify({"success": False, "message": "No trading engine available"}), 400
     token_id = data.get("token_id", "")
     price = data.get("price", 0.5)
     size = data.get("size", 10)
@@ -727,7 +953,7 @@ def api_place_order():
     try:
         loop = asyncio.new_event_loop()
         result = loop.run_until_complete(
-            bot_instance.place_order(
+            bot.place_order(
                 token_id=token_id,
                 price=float(price),
                 size=float(size),
@@ -738,7 +964,8 @@ def api_place_order():
         )
         loop.close()
         bot_state["errors"].append(
-            {"time": time.strftime("%H:%M:%S"), "error": f"Order {side} {size}@{price} on {token_id[:16]}..."}
+            {"time": time.strftime("%H:%M:%S"),
+             "error": f"[{active_mode().upper()}] Order {side} {size}@{price} on {token_id[:16]}..."}
         )
         return jsonify(result.__dict__ if hasattr(result, "__dict__") else result)
     except Exception as e:
@@ -748,11 +975,12 @@ def api_place_order():
 @app.route("/api/order/<order_id>/cancel", methods=["POST"])
 @require_auth
 def api_cancel_order(order_id):
-    if not bot_instance:
-        return jsonify({"success": False, "message": "Bot not initialized"}), 400
+    bot = active_bot()
+    if bot is None:
+        return jsonify({"success": False, "message": "No trading engine available"}), 400
     try:
         loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(bot_instance.cancel_order(order_id))
+        result = loop.run_until_complete(bot.cancel_order(order_id))
         loop.close()
         return jsonify(result.__dict__ if hasattr(result, "__dict__") else result)
     except Exception as e:
@@ -762,11 +990,12 @@ def api_cancel_order(order_id):
 @app.route("/api/orders/cancel-all", methods=["POST"])
 @require_auth
 def api_cancel_all():
-    if not bot_instance:
-        return jsonify({"success": False, "message": "Bot not initialized"}), 400
+    bot = active_bot()
+    if bot is None:
+        return jsonify({"success": False, "message": "No trading engine available"}), 400
     try:
         loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(bot_instance.cancel_all_orders())
+        result = loop.run_until_complete(bot.cancel_all_orders())
         loop.close()
         return jsonify(result.__dict__ if hasattr(result, "__dict__") else result)
     except Exception as e:
@@ -815,13 +1044,14 @@ def api_markets():
 @app.route("/api/trades")
 @require_auth
 def api_trades():
-    if not bot_instance:
+    bot = active_bot()
+    if bot is None:
         return jsonify([])
     token_id = request.args.get("token_id", None)
     limit = int(request.args.get("limit", 20))
     try:
         loop = asyncio.new_event_loop()
-        trades = loop.run_until_complete(bot_instance.get_trades(token_id, limit))
+        trades = loop.run_until_complete(bot.get_trades(token_id, limit))
         loop.close()
         return jsonify(trades)
     except Exception as e:
@@ -885,6 +1115,7 @@ def _try_start_bot_loop():
         bot_loop_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(bot_loop_loop)
         threading.Thread(target=_market_loop, daemon=True, name="market-loop").start()
+        threading.Thread(target=_status_loop, daemon=True, name="status-loop").start()
 
         from scripts.run_bot import check_env_mode, load_config_from_env, get_private_key_from_env
         from src.bot import TradingBot
@@ -931,6 +1162,7 @@ async def _market_loop_async():
                 prices = info.get("prices", {})
                 up = prices.get("up")
                 bot_state["last_price"] = str(up) if up is not None else None
+                token_ids = info.get("token_ids", {})
                 bot_state["market"] = {
                     "coin": coin,
                     "question": info.get("question"),
@@ -940,16 +1172,91 @@ async def _market_loop_async():
                     "down_price": prices.get("down"),
                     "best_bid": info.get("best_bid"),
                     "best_ask": info.get("best_ask"),
+                    "token_ids": token_ids,
                 }
+
+                if paper_instance is not None and token_ids:
+                    await _settle_paper(token_ids)
+
         except Exception as e:
             bot_state["errors"].append({"time": time.strftime("%H:%M:%S"), "error": f"Market poll: {e}"})
             if len(bot_state["errors"]) > 50:
                 bot_state["errors"] = bot_state["errors"][-50:]
-        await asyncio.sleep(10)
+        await asyncio.sleep(PAPER_SETTLE_INTERVAL)
+
+
+async def _settle_paper(token_ids):
+    """Price resting paper orders off the real CLOB books and fill the crosses."""
+    if not token_ids:
+        return
+
+    def _books():
+        out = {}
+        for key, tid in token_ids.items():
+            if not tid:
+                continue
+            book = paper_instance.fetch_book(tid)
+            quote = paper_instance.top_of_book(book)
+            if quote.get("bid") is not None or quote.get("ask") is not None:
+                out[tid] = quote
+        return out
+
+    books = await asyncio.to_thread(_books)
+    if not books:
+        return
+    fills = paper_instance.settle(books)
+    for f in fills:
+        _push_alert(
+            "PAPER FILL {} {} @ {} ({} shares)".format(
+                f["side"], f["token_id"][:10], f["price"], f["size"]
+            ),
+            "info",
+        )
+
+
+def _status_loop():
+    """Polls the active engine for orders, balance and fills.
+
+    Runs in DRY mode too, so the simulated account is always reflected.
+    """
+    asyncio.run(_status_loop_async())
+
+
+async def _status_loop_async():
+    interval = float(os.environ.get("POLY_STATUS_INTERVAL", "10"))
+    iteration = 0
+    while running:
+        iteration += 1
+        bot_state["iterations"] = iteration
+        bot_state["last_update"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        await _refresh_engine_state()
+        await asyncio.sleep(interval)
+
+
+async def _refresh_engine_state():
+    """Pull open orders, balance and trades from whichever engine is active."""
+    engine = active_bot()
+    if engine is None:
+        return
+    try:
+        orders = await engine.get_open_orders()
+        bot_state["open_orders"] = (orders or [])[:20]
+    except Exception:
+        pass
+    try:
+        balance = await engine.get_balance()
+        if balance:
+            bot_state["balance"] = balance
+    except Exception:
+        pass
+    try:
+        trades = await engine.get_trades(limit=10)
+        bot_state["recent_trades"] = (trades or [])[:10]
+    except Exception:
+        pass
 
 
 async def _bot_loop(bot):
-    global bot_state, bot_instance
     interval = int(os.environ.get("POLY_BOT_INTERVAL", "60"))
     iteration = 0
     while running:
@@ -961,23 +1268,6 @@ async def _bot_loop(bot):
                 price = await bot.get_market_price(bot.config.default_token_id)
                 if price:
                     bot_state["last_price"] = str(price)
-            try:
-                orders = await bot.get_open_orders()
-                bot_state["open_orders"] = (orders or [])[:20]
-            except Exception:
-                pass
-            try:
-                balance = await bot.get_balance()
-                if balance:
-                    bot_state["balance"] = balance
-            except Exception:
-                pass
-            try:
-                trades = await bot.get_trades(limit=10)
-                if trades:
-                    bot_state["recent_trades"] = trades[:10]
-            except Exception:
-                pass
         except Exception as e:
             bot_state["errors"].append({"time": time.strftime("%H:%M:%S"), "error": str(e)})
             if len(bot_state["errors"]) > 50:
@@ -1027,10 +1317,10 @@ def _ensure_strategy_loop():
 
 
 def _stop_strategy():
-    global strategy_instance, strategy_task
+    global strategy_instance, strategy_future
     with strategy_lock:
-        instance, task = strategy_instance, strategy_task
-        strategy_instance, strategy_task = None, None
+        instance, future = strategy_instance, strategy_future
+        strategy_instance, strategy_future = None, None
         bot_state["strategy_running"] = False
 
     if instance is not None:
@@ -1040,9 +1330,9 @@ def _stop_strategy():
             pass
         _push_alert("Strategy stopped.", "info")
 
-    if task is not None and strategy_loop is not None:
+    if future is not None:
         try:
-            strategy_loop.call_soon_threadsafe(task.cancel)
+            future.cancel()
         except Exception:
             pass
 
@@ -1050,6 +1340,7 @@ def _stop_strategy():
 def _build_strategy(name, config):
     config = dict(config or {})
     coin = str(config.pop("coin", DEFAULT_COIN)).upper()
+    engine = active_bot()
 
     if name == "grid":
         from strategies.grid import GridStrategy, GridConfig
@@ -1059,7 +1350,7 @@ def _build_strategy(name, config):
             range_pct=float(config.get("range", config.get("range_pct", 2.0))),
             size=float(config.get("size", 10.0)),
         )
-        return GridStrategy(bot=bot_instance, config=cfg)
+        return GridStrategy(bot=engine, config=cfg)
 
     if name == "flash_crash":
         from strategies.flash_crash import FlashCrashStrategy, FlashCrashConfig
@@ -1071,7 +1362,7 @@ def _build_strategy(name, config):
             take_profit=float(config.get("take_profit", 0.10)),
             stop_loss=float(config.get("stop_loss", 0.05)),
         )
-        return FlashCrashStrategy(bot=bot_instance, config=cfg)
+        return FlashCrashStrategy(bot=engine, config=cfg)
 
     if name == "arb":
         from strategies.arb import ArbStrategy, ArbConfig
@@ -1080,17 +1371,29 @@ def _build_strategy(name, config):
             threshold=float(config.get("threshold", 0.05)),
             size=float(config.get("size", 5.0)),
         )
-        return ArbStrategy(bot=bot_instance, config=cfg)
+        return ArbStrategy(bot=engine, config=cfg)
 
     raise ValueError("Unknown strategy: {}".format(name))
 
 
 def _start_strategy(name, config):
-    global strategy_instance, strategy_task
+    global strategy_instance, strategy_future
 
     _stop_strategy()
     loop = _ensure_strategy_loop()
     instance = _build_strategy(name, config)
+
+    async def _main():
+        try:
+            await instance.run()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            bot_state["strategy_running"] = False
+            bot_state["strategy_error"] = str(e)
+            _push_alert("Strategy {} crashed: {}".format(name, e), "error")
+        else:
+            bot_state["strategy_running"] = False
 
     with strategy_lock:
         strategy_instance = instance
@@ -1099,20 +1402,9 @@ def _start_strategy(name, config):
         bot_state["strategy_error"] = None
         bot_state["strategy_running"] = True
 
-    def _runner():
-        async def _main():
-            try:
-                await instance.run()
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                bot_state["strategy_running"] = False
-                bot_state["strategy_error"] = str(e)
-                _push_alert("Strategy {} crashed: {}".format(name, e), "error")
-
-        loop.run_until_complete(_main())
-
-    threading.Thread(target=_runner, daemon=True, name="strategy-{}".format(name)).start()
+    future = asyncio.run_coroutine_threadsafe(_main(), loop)
+    with strategy_lock:
+        strategy_future = future
     _push_alert("Strategy {} started.".format(name), "info")
 
 
@@ -1128,8 +1420,11 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
 
     # Strip em dashes from HTML for Python 3 compat
-    global DASHBOARD_HTML
+    global DASHBOARD_HTML, TRADING_MODE
     DASHBOARD_HTML = DASHBOARD_HTML.replace("\u2014", "--")
+
+    TRADING_MODE = _load_mode()
+    print(f"[web_dashboard] Trading mode: {TRADING_MODE}")
 
     _warm_imports()
 

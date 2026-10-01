@@ -25,6 +25,7 @@ from typing import Dict, List
 
 from strategies.base import BaseStrategy, StrategyConfig
 from src.bot import TradingBot
+from src.websocket_client import OrderbookSnapshot
 
 
 @dataclass
@@ -50,6 +51,10 @@ class GridStrategy(BaseStrategy):
         self.grid_config = config
         self.grid_orders: List[Dict] = []
         self._mid_price: float = 0
+
+    async def on_book_update(self, snapshot: OrderbookSnapshot) -> None:
+        """No-op: the grid rebuilds from the mid price on each tick."""
+        pass
 
     async def on_tick(self, prices: Dict[str, float]) -> None:
         """Rebuild grid on each tick."""

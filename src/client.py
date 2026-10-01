@@ -381,6 +381,29 @@ class ClobClient(ApiClient):
             params={"token_id": token_id}
         )
 
+    def get_balance(self, signature_type: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Get USDC collateral balance for the funder.
+
+        Authenticated with L2 credentials. Signature type defaults to the
+        funder's configured type (2 for a Polymarket Safe/proxy wallet).
+
+        Args:
+            signature_type: Override the configured signature type
+
+        Returns:
+            Balance payload from the CLOB API
+        """
+        params: Dict[str, Any] = {
+            "asset_type": "COLLATERAL",
+            "signature_type": (
+                signature_type
+                if signature_type is not None
+                else getattr(self, "signature_type", 2)
+            ),
+        }
+        return self._request("GET", "/balance", params=params)
+
     def get_market_price(self, token_id: str) -> Dict[str, Any]:
         """
         Get current market price for a token.

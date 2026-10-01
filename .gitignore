@@ -39,6 +39,9 @@ htmlcov/
 config.yaml
 credentials/
 
+# Paper-trading simulated account state (balance, positions, fills)
+data/
+
 # Logs and local data
 *.log
 

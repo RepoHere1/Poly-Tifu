@@ -26,6 +26,7 @@ from typing import Dict
 
 from strategies.base import BaseStrategy, StrategyConfig
 from src.bot import TradingBot
+from src.websocket_client import OrderbookSnapshot
 
 
 @dataclass
@@ -47,6 +48,10 @@ class ArbStrategy(BaseStrategy):
         super().__init__(bot, config)
         self.arb_config = config
         self.last_opportunity: Dict = {}
+
+    async def on_book_update(self, snapshot: OrderbookSnapshot) -> None:
+        """No-op: the arb check runs off the tick price pair."""
+        pass
 
     async def on_tick(self, prices: Dict[str, float]) -> None:
         """Check for arb opportunity on each tick."""

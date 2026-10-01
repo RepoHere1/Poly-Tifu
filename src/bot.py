@@ -468,6 +468,30 @@ class TradingBot:
             logger.error(f"Failed to cancel market orders: {e}")
             return OrderResult(success=False, message=str(e))
 
+    async def get_balance(self) -> Dict[str, Any]:
+        """
+        Get USDC collateral balance for the funder.
+
+        Requires L2 API credentials, which are derived on init when a private
+        key is supplied.
+
+        Returns:
+            Balance payload, normalised to a float in 'balance' where possible
+        """
+        try:
+            payload = await self._run_in_thread(self.clob_client.get_balance)
+            balance = None
+            if isinstance(payload, dict):
+                balance = payload.get("balance")
+            return {
+                "simulated": False,
+                "balance": balance,
+                "raw": payload,
+            }
+        except Exception as e:
+            logger.error(f"Failed to get balance: {e}")
+            return {"simulated": False, "balance": None, "error": str(e)}
+
     async def get_open_orders(self) -> List[Dict[str, Any]]:
         """
         Get all open orders.

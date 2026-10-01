@@ -62,6 +62,7 @@ GAMMA_CLIENT_CLS = None
 paper_instance = None
 TRADING_MODE = "live"
 _previous_token_ids = None
+equity_tracker = None
 
 
 def _warm_imports():
@@ -71,7 +72,7 @@ def _warm_imports():
     Letting two worker threads trigger those imports at once deadlocks on the
     per-module import locks, so it is done up front and serialized.
     """
-    global GAMMA_CLIENT_CLS, paper_instance
+    global GAMMA_CLIENT_CLS, paper_instance, equity_tracker
     try:
         from src.gamma_client import GammaClient
         GAMMA_CLIENT_CLS = GammaClient
@@ -79,6 +80,17 @@ def _warm_imports():
     except Exception as e:
         print(f"[web_dashboard] src import failed, market polling disabled: {e}")
         return
+    try:
+        from src.analytics import EquityTracker
+
+        equity_tracker = EquityTracker()
+        threading.Thread(
+            target=equity_tracker.start_autosave, daemon=True, name="equity-autosave"
+        ).start()
+        print(f"[web_dashboard] Equity history at {equity_tracker.path}")
+    except Exception as e:
+        print(f"[web_dashboard] Equity tracker failed to start: {e}")
+
     try:
         from src.paper_bot import PaperTradingBot
 
@@ -279,6 +291,32 @@ footer { margin-top:2rem; text-align:center; color:var(--muted); font-size:.75re
 .mode-btn.dry.on { background:var(--green); color:#04231a; }
 .mode-btn:disabled { opacity:.35; cursor:not-allowed; }
 .mode-state { font-size:.68rem; color:var(--muted); margin-top:.35rem; text-align:right; }
+
+.mcards { display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); gap:.85rem; }
+.mcard { background:var(--card); border:1px solid var(--border); border-radius:14px;
+         padding:.9rem 1rem 1rem; position:relative; overflow:hidden; }
+.mcard .k { font-size:.68rem; color:var(--muted); text-transform:uppercase;
+           letter-spacing:.06em; margin-bottom:.35rem; }
+.mcard .v { font-size:1.42rem; font-weight:700; line-height:1.15; }
+.mcard .s { font-size:.7rem; color:var(--muted); margin-top:.22rem; }
+.mcard svg { display:block; width:100%; height:48px; margin-top:.55rem; overflow:visible; }
+.spark path.line { fill:none; stroke-width:2; stroke-linecap:round; stroke-linejoin:round;
+  stroke-dasharray:var(--len); stroke-dashoffset:var(--len); animation:draw 1.1s ease-out forwards; }
+.spark path.area { opacity:0; animation:fadein .9s ease-out .25s forwards; }
+.spark circle { animation:pop .4s ease-out .9s backwards; }
+@keyframes draw { to { stroke-dashoffset:0; } }
+@keyframes fadein { to { opacity:1; } }
+@keyframes pop { from { opacity:0; transform:scale(.2); } to { opacity:1; transform:scale(1); } }
+.spark circle { transform-origin:center; transform-box:fill-box; }
+.tally { display:flex; height:8px; border-radius:5px; overflow:hidden; margin-top:.75rem;
+         background:#1e293b; }
+.tally i { display:block; height:100%; }
+.tally .w { background:var(--green); }
+.tally .l { background:var(--red); }
+.tally .f { background:#475569; }
+.tally-key { display:flex; gap:.9rem; font-size:.67rem; color:var(--muted); margin-top:.4rem;
+             flex-wrap:wrap; }
+.swatch { display:inline-block; width:7px; height:7px; border-radius:2px; margin-right:4px; }
 </style>
 </head>
 <body>
@@ -397,6 +435,24 @@ footer { margin-top:2rem; text-align:center; color:var(--muted); font-size:.75re
 </div>
 
 <div class="card">
+  <h2 class="sec">Performance</h2>
+  <p class="note" id="ledgerMode" style="margin:0 0 .8rem">Loading...</p>
+  <div class="mcards" id="cards"></div>
+</div>
+
+<div class="card">
+  <h2 class="sec">Open trades</h2>
+  <p class="note" style="margin:0 0 .7rem">Positions you still hold, marked to the live book, plus resting orders that have not filled yet.</p>
+  <div id="openTrades"></div>
+</div>
+
+<div class="card">
+  <h2 class="sec">Closed trades</h2>
+  <p class="note" style="margin:0 0 .7rem">Round trips matched oldest-lot-first, with realised PnL for each.</p>
+  <div id="closedTrades"></div>
+</div>
+
+<div class="card">
   <h2 class="sec">Balance &amp; simulated account</h2>
   <div class="form-row" style="margin-bottom:.6rem">
     <button class="btn ghost" onclick="resetPaper()">Reset simulated account</button>
@@ -467,6 +523,211 @@ const J = { ...H, 'Content-Type': 'application/json' };
 function txt(id, v) { $(id).textContent = (v === null || v === undefined || v === '') ? '--' : String(v); }
 function say(id, v) { $(id).textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2); }
 
+function money(v, dp) {
+  const n = Number(v || 0);
+  const d = dp === undefined ? 2 : dp;
+  return (n < 0 ? '-$' : '$') + Math.abs(n).toLocaleString('en-US',
+    { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+function signed(v, dp) {
+  const n = Number(v || 0);
+  return (n > 0 ? '+' : '') + money(n, dp);
+}
+function pct(v) {
+  const n = Number(v || 0);
+  return (n > 0 ? '+' : '') + n.toFixed(2) + '%';
+}
+function shortToken(id) { return id ? String(id).slice(0, 8) + '..' + String(id).slice(-4) : '-'; }
+function shortTime(ts) {
+  if (ts === null || ts === undefined || ts === '') return '-';
+  let n;
+  if (typeof ts === 'number') {
+    n = ts > 1e11 ? ts : ts * 1000;
+  } else {
+    const parsed = Date.parse(ts);
+    if (!isFinite(parsed)) return '-';
+    n = parsed;
+  }
+  return new Date(n).toLocaleTimeString('en-US', { hour12: false });
+}
+function dur(sec) {
+  const n = Number(sec || 0);
+  if (n < 60) return n.toFixed(0) + 's';
+  if (n < 3600) return Math.floor(n / 60) + 'm ' + Math.floor(n % 60) + 's';
+  return Math.floor(n / 3600) + 'h ' + Math.floor((n % 3600) / 60) + 'm';
+}
+function cls(v) { return Number(v || 0) > 0 ? 'green' : Number(v || 0) < 0 ? 'red' : 'muted'; }
+
+/* Smooth curve through points using Catmull-Rom converted to cubic bezier. */
+function curvePath(pts) {
+  if (pts.length < 2) return '';
+  let d = 'M ' + pts[0][0] + ' ' + pts[0][1];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[i - 1] || pts[i];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[i + 2] || p2;
+    const c1x = p1[0] + (p2[0] - p0[0]) / 6;
+    const c1y = p1[1] + (p2[1] - p0[1]) / 6;
+    const c2x = p2[0] - (p3[0] - p1[0]) / 6;
+    const c2y = p2[1] - (p3[1] - p1[1]) / 6;
+    d += ' C ' + c1x + ' ' + c1y + ', ' + c2x + ' ' + c2y + ', ' + p2[0] + ' ' + p2[1];
+  }
+  return d;
+}
+
+function spark(values, color, baseline) {
+  const vals = (values || []).map(Number).filter(v => isFinite(v));
+  if (vals.length < 2) return '<svg class="spark" viewBox="0 0 100 30" preserveAspectRatio="none"></svg>';
+  const W = 100, H = 30, pad = 3;
+  let lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+  if (baseline !== undefined && baseline !== null) { lo = Math.min(lo, Number(baseline)); hi = Math.max(hi, Number(baseline)); }
+  if (hi - lo < 1e-9) { hi += 0.5; lo -= 0.5; }
+  const pts = vals.map((v, i) => [
+    pad + (i * (W - pad * 2)) / (vals.length - 1),
+    H - pad - ((v - lo) / (hi - lo)) * (H - pad * 2)
+  ]);
+  const line = curvePath(pts);
+  const area = line + ' L ' + pts[pts.length - 1][0] + ' ' + (H - pad)
+    + ' L ' + pts[0][0] + ' ' + (H - pad) + ' Z';
+  const uid = 'g' + Math.random().toString(36).slice(2, 8);
+  const last = pts[pts.length - 1];
+  let base = '';
+  if (baseline !== undefined && baseline !== null) {
+    const by = H - pad - ((Number(baseline) - lo) / (hi - lo)) * (H - pad * 2);
+    base = '<path d="M ' + pad + ' ' + by + ' L ' + (W - pad) + ' ' + by
+      + '" stroke="#334155" stroke-width="1" stroke-dasharray="3 3" fill="none"/>';
+  }
+  return '<svg class="spark" viewBox="0 0 100 30" preserveAspectRatio="none">'
+    + '<defs><linearGradient id="' + uid + '" x1="0" y1="0" x2="0" y2="1">'
+    + '<stop offset="0%" stop-color="' + color + '" stop-opacity=".38"/>'
+    + '<stop offset="100%" stop-color="' + color + '" stop-opacity="0"/></linearGradient></defs>'
+    + base
+    + '<path class="area" d="' + area + '" fill="url(#' + uid + ')"/>'
+    + '<path class="line" d="' + line + '" stroke="' + color + '" style="--len:400"/>'
+    + '<circle cx="' + last[0] + '" cy="' + last[1] + '" r="2.6" fill="' + color + '"/>'
+    + '</svg>';
+}
+
+function card(key, value, sub, svgHtml, extra) {
+  return '<div class="mcard"><div class="k">' + key + '</div>'
+    + '<div class="v">' + value + '</div>'
+    + '<div class="s">' + (sub || '') + '</div>'
+    + (svgHtml || '') + (extra || '') + '</div>';
+}
+
+function table(cols, rows) {
+  if (!rows || !rows.length) return '<p class="note">none</p>';
+  let h = '<table><thead><tr>';
+  for (const c of cols) h += '<th>' + c + '</th>';
+  h += '</tr></thead><tbody>';
+  for (const r of rows) {
+    h += '<tr>';
+    for (const c of r) h += '<td>' + c + '</td>';
+    h += '</tr>';
+  }
+  return h + '</tbody></table>';
+}
+
+function renderLedger(d) {
+  const b = d.balance || {};
+  const st = d.stats || {};
+  const s = d.equity_series || [];
+  const es = d.equity_summary || {};
+  const dry = d.mode === 'dry';
+  const blue = '#3b82f6', green = '#22c55e', red = '#ef4444', purple = '#a855f7';
+
+  const eq = s.map(x => x.equity), cash = s.map(x => x.cash),
+        pv = s.map(x => x.positions_value), unp = s.map(x => x.unrealized_pnl),
+        rp = s.map(x => x.realized_pnl);
+
+  const equity = b.equity !== undefined ? b.equity : (es.current || 0);
+  const totalPnl = b.total_pnl !== undefined ? b.total_pnl : (es.change || 0);
+  const cashV = b.cash !== undefined ? b.cash : 0;
+  const posV = b.positions_value !== undefined ? b.positions_value : 0;
+  const realized = b.realized_pnl !== undefined ? b.realized_pnl : 0;
+  const unrealized = (b.positions || []).reduce((a, p) => a + Number(p.unrealized_pnl || 0), 0);
+
+  let h = '';
+
+  h += card('Equity', '<span class="' + cls(totalPnl) + '">' + money(equity) + '</span>',
+    'session ' + signed(totalPnl) + (es.duration_seconds ? ' over ' + dur(es.duration_seconds) : ''),
+    spark(eq, totalPnl >= 0 ? green : red, es.starting));
+
+  h += card('Total P&amp;L', '<span class="' + cls(totalPnl) + '">' + signed(totalPnl) + '</span>',
+    'peak ' + money(es.peak || equity) + ' &middot; low ' + money(es.trough || equity),
+    spark(eq.map((v, i) => v - (s[0] ? s[0].equity : 0)), totalPnl >= 0 ? green : red, 0));
+
+  h += card('Buying power', money(cashV, 2),
+    b.free_cash !== undefined ? money(b.free_cash, 2) + ' free of ' + money(b.reserved_cash || 0, 2) + ' reserved' : 'cash on hand',
+    spark(cash, blue));
+
+  h += card('Positions value', money(posV, 2),
+    (b.positions || []).length + ' open position(s)',
+    spark(pv, purple));
+
+  h += card('Unrealised P&amp;L', '<span class="' + cls(unrealized) + '">' + signed(unrealized) + '</span>',
+    'marked to live book',
+    spark(unp, unrealized >= 0 ? green : red, 0));
+
+  h += card('Realised P&amp;L', '<span class="' + cls(realized) + '">' + signed(realized) + '</span>',
+    (st.fills || 0) + ' fill(s) booked',
+    spark(rp, realized >= 0 ? green : red, 0));
+
+  const closed = st.closed_count || 0, wins = st.wins || 0, losses = st.losses || 0, flat = st.flat || 0;
+  const tot = Math.max(closed, 1);
+  const tallyBar = '<div class="tally">'
+    + '<i class="w" style="width:' + (wins / tot * 100) + '%"></i>'
+    + '<i class="l" style="width:' + (losses / tot * 100) + '%"></i>'
+    + '<i class="f" style="width:' + (flat / tot * 100) + '%"></i></div>'
+    + '<div class="tally-key">'
+    + '<span><span class="swatch" style="background:var(--green)"></span>' + wins + 'W</span>'
+    + '<span><span class="swatch" style="background:var(--red)"></span>' + losses + 'L</span>'
+    + '<span><span class="swatch" style="background:#475569"></span>' + flat + 'F</span>'
+    + '<span>PF ' + (st.profit_factor ? st.profit_factor
+        : (closed > 0 && losses === 0 ? '&infin;' : '-')) + '</span>'
+    + '</div>';
+  h += card('Win rate', (st.win_rate || 0).toFixed(1) + '%',
+    closed + ' closed trade(s)', '', tallyBar);
+
+  h += card('Best / worst',
+    '<span class="green">' + signed(st.best || 0) + '</span> / <span class="red">' + signed(st.worst || 0) + '</span>',
+    'avg hold ' + dur(st.avg_hold_seconds || 0) + ' &middot; ' + (st.open_count || 0) + ' open',
+    spark((s.map(x => x.realized_pnl)), purple));
+
+  $('cards').innerHTML = h;
+  $('ledgerMode').textContent = (dry ? 'DRY' : 'LIVE')
+    + ' account · ' + (st.open_count || 0) + ' open, ' + (st.closed_count || 0) + ' closed, '
+    + (st.fills || 0) + ' fills. Market data is live in both modes.';
+
+  const openRows = (d.open_trades || []).map(t => {
+    if (t.status === 'OPEN') {
+      return ['<strong>POSITION</strong>', t.market ? t.market.slice(0, 42) : shortToken(t.token_id),
+        t.outcome || 'LONG', money(t.entry, 3), t.size.toFixed(2), money(t.mark, 3),
+        '<span class="' + cls(t.unrealized) + '">' + signed(t.unrealized) + '</span>',
+        '<span class="' + cls(t.unrealized_pct) + '">' + pct(t.unrealized_pct) + '</span>',
+        shortTime(t.opened_at), dur(t.age_seconds)];
+    }
+    return ['<span class="chip">' + (t.status || 'PENDING') + '</span>',
+      shortToken(t.token_id), t.side || '', money(t.entry, 3),
+      t.size.toFixed(2), (t.filled || 0).toFixed(2),
+      '<span class="muted">' + (t.resting || t.size).toFixed(2) + ' left</span>',
+      '-', '-', shortTime(t.opened_at), t.age_seconds ? dur(t.age_seconds) : '-'];
+  });
+  $('openTrades').innerHTML = table(
+    ['Type', 'Market', 'Side', 'Price', 'Size', 'Filled', 'Unrealised', '%', 'Opened', 'Age'], openRows);
+
+  const closedRows = (d.closed_trades || []).map(t => [
+    t.market ? t.market.slice(0, 40) : shortToken(t.token_id),
+    t.outcome || '', money(t.entry, 3), money(t.exit, 3), t.size.toFixed(2),
+    '<strong class="' + cls(t.pnl) + '">' + signed(t.pnl) + '</strong>',
+    '<span class="' + cls(t.pnl_pct) + '">' + pct(t.pnl_pct) + '</span>',
+    shortTime(t.opened_at), shortTime(t.closed_at), dur(t.hold_seconds)]);
+  $('closedTrades').innerHTML = table(
+    ['Market', 'Outcome', 'Entry', 'Exit', 'Size', 'Realised P&amp;L', 'Return', 'Opened', 'Closed', 'Held'], closedRows);
+}
+
+
 async function loadData() {
   try {
     const d = await (await fetch('/api/status', { headers: H })).json();
@@ -530,6 +791,14 @@ async function loadData() {
       ? (d.strategy + ': ' + det.summary + (d.strategy_error ? ' -- ' + d.strategy_error : (d.strategy_running ? ' -- running.' : ' -- selected, not running.')))
       : 'No strategy running.';
   } catch (e) { say('activity', 'status fetch failed: ' + e.message); }
+}
+
+async function loadLedger() {
+  try {
+    const d = await (await fetch('/api/ledger', { headers: H })).json();
+    if (d.error) { $('ledgerMode').textContent = d.error; return; }
+    renderLedger(d);
+  } catch (e) { $('ledgerMode').textContent = 'ledger failed: ' + e.message; }
 }
 
 async function setMode(mode) {
@@ -689,7 +958,9 @@ es.onmessage = (e) => {
 es.onerror = () => { $('alertLog').insertAdjacentHTML('afterbegin', '<p class="note">stream reconnecting...</p>'); };
 
 setInterval(loadData, 5000);
+setInterval(loadLedger, 5000);
 loadData();
+loadLedger();
 loadSystem();
 loadMarkets();
 syncStrategyForm();
@@ -928,10 +1199,12 @@ def api_set_mode():
 @app.route("/api/paper/reset", methods=["POST"])
 @require_auth
 def api_paper_reset():
-    """Reset the simulated account back to its starting balance."""
+    """Reset the simulated account and its equity curve."""
     if paper_instance is None:
         return jsonify({"success": False, "message": "Paper engine unavailable"}), 503
     paper_instance.reset()
+    if equity_tracker is not None:
+        equity_tracker.reset("dry")
     _push_alert("Paper account reset to starting cash.", "warn")
     return jsonify({"success": True, "cash": paper_instance.cash})
 
@@ -1256,6 +1529,7 @@ async def _refresh_engine_state():
     engine = active_bot()
     if engine is None:
         return
+    balance = None
     try:
         orders = await engine.get_open_orders()
         bot_state["open_orders"] = (orders or [])[:20]
@@ -1272,6 +1546,85 @@ async def _refresh_engine_state():
         bot_state["recent_trades"] = (trades or [])[:10]
     except Exception:
         pass
+    if equity_tracker is not None and balance:
+        equity_tracker.record(active_mode(), balance)
+
+
+async def _collect_ledger():
+    """
+    Build the OPEN / CLOSED trade ledger and card tallies for the active engine.
+
+    Works identically for LIVE and DRY: the only difference is which engine the
+    raw fills, orders and positions come from.
+    """
+    from src.analytics import build_ledger
+
+    engine = active_bot()
+    mode = active_mode()
+    if engine is None:
+        return {"open_trades": [], "closed_trades": [], "stats": {}, "mode": mode}
+
+    orders = []
+    fills = []
+    balance = {}
+    marks = {}
+
+    try:
+        orders = await engine.get_open_orders() or []
+    except Exception:
+        pass
+    try:
+        fills = await engine.get_trades(None, 200) or []
+    except Exception:
+        pass
+    try:
+        balance = await engine.get_balance() or {}
+    except Exception:
+        pass
+
+    if getattr(engine, "last_marks", None):
+        marks = dict(engine.last_marks)
+
+    ledger = build_ledger(fills, orders, marks)
+
+    if balance:
+        ledger["balance"] = balance
+    ledger["mode"] = mode
+
+    if equity_tracker is not None and balance:
+        summary = equity_tracker.summary(mode)
+        ledger["equity_series"] = summary.get("samples", [])
+        ledger["equity_summary"] = {
+            k: summary.get(k)
+            for k in ("starting", "current", "peak", "trough", "change", "duration_seconds")
+        }
+
+    ledger["stats"]["fills"] = balance.get("fills", len(fills))
+
+    return ledger
+
+
+@app.route("/api/ledger")
+@require_auth
+def api_ledger():
+    """OPEN and CLOSED trades plus card tallies for the active engine."""
+    if active_bot() is paper_instance:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_refresh_engine_state())
+        except Exception:
+            pass
+        finally:
+            loop.close()
+
+    loop = asyncio.new_event_loop()
+    try:
+        data = loop.run_until_complete(_collect_ledger())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        loop.close()
+    return jsonify(data)
 
 
 async def _bot_loop(bot):

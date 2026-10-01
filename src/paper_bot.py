@@ -350,6 +350,8 @@ class PaperTradingBot(ThreadLocalSessionMixin):
             "order_id": order_id,
             "created_at": self._now(),
             "timestamp": self._now(),
+            "ts": time.time(),
+            "seq": self.fills,
             "side": order["side"],
             "price": fill_price,
             "size": fill_size,
@@ -405,12 +407,15 @@ class PaperTradingBot(ThreadLocalSessionMixin):
                 self.realized_pnl = round(
                     self.realized_pnl + (mark - avg) * pos["size"], 6
                 )
+                self.fills += 1
                 self.trades.append(
                     {
                         "id": f"paper-{uuid.uuid4().hex[:16]}",
                         "order_id": None,
                         "created_at": self._now(),
                         "timestamp": self._now(),
+                        "ts": time.time(),
+                        "seq": self.fills,
                         "side": "SETTLE",
                         "price": mark,
                         "size": pos["size"],
@@ -420,7 +425,6 @@ class PaperTradingBot(ThreadLocalSessionMixin):
                         "notional": proceeds,
                     }
                 )
-                self.fills += 1
                 pos["size"] = 0.0
                 pos["cost"] = 0.0
                 settled += 1

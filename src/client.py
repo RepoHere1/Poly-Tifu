@@ -41,6 +41,8 @@ import requests
 from .config import BuilderConfig
 from .http import ThreadLocalSessionMixin
 
+DATA_API_HOST = "https://data-api.polymarket.com"
+
 
 class ApiError(Exception):
     """Base exception for API errors."""
@@ -383,26 +385,48 @@ class ClobClient(ApiClient):
 
     def get_balance(self, signature_type: Optional[int] = None) -> Dict[str, Any]:
         """
-        Get USDC collateral balance for the funder.
+        Get position value and open positions for the funder.
 
-        Authenticated with L2 credentials. Signature type defaults to the
-        funder's configured type (2 for a Polymarket Safe/proxy wallet).
+        The CLOB v2 API exposes no cash-balance route, so this reads the public
+        Polymarket Data API, which needs no credentials. It reports positions
+        value and PnL, not idle cash.
 
         Args:
-            signature_type: Override the configured signature type
+            signature_type: Unused; accepted for interface symmetry
 
         Returns:
-            Balance payload from the CLOB API
+            Dict with 'value', 'positions' and 'position_count'
         """
-        params: Dict[str, Any] = {
-            "asset_type": "COLLATERAL",
-            "signature_type": (
-                signature_type
-                if signature_type is not None
-                else getattr(self, "signature_type", 2)
-            ),
+        user = self.funder
+        if not user:
+            raise ValueError("No funder address configured for balance lookup")
+
+        def _get(path: str, params: Dict[str, Any]) -> Any:
+            r = self.session.get(
+                f"{DATA_API_HOST}{path}", params=params, timeout=self.timeout
+            )
+            r.raise_for_status()
+            return r.json() if r.text else {}
+
+        value_payload = _get("/value", {"user": user})
+        positions_payload = _get(
+            "/positions", {"user": user, "limit": 50, "sizeThreshold": 0}
+        )
+
+        positions = positions_payload if isinstance(positions_payload, list) else []
+        total_value = 0.0
+        if isinstance(value_payload, list) and value_payload:
+            try:
+                total_value = float(value_payload[0].get("value", 0) or 0)
+            except Exception:
+                total_value = 0.0
+
+        return {
+            "value": total_value,
+            "position_count": len(positions),
+            "positions": positions[:50],
+            "note": "positions value from the Data API; idle USDC cash is not exposed by the CLOB API",
         }
-        return self._request("GET", "/balance", params=params)
 
     def get_market_price(self, token_id: str) -> Dict[str, Any]:
         """

@@ -470,27 +470,28 @@ class TradingBot:
 
     async def get_balance(self) -> Dict[str, Any]:
         """
-        Get USDC collateral balance for the funder.
+        Get position value and PnL for the funder.
 
-        Requires L2 API credentials, which are derived on init when a private
-        key is supplied.
+        Note: the Polymarket CLOB API does not expose idle USDC cash, so this
+        reports positions value from the public Data API rather than a
+        spendable cash figure.
 
         Returns:
-            Balance payload, normalised to a float in 'balance' where possible
+            Dict with 'value', 'positions' and 'position_count'
         """
         try:
             payload = await self._run_in_thread(self.clob_client.get_balance)
-            balance = None
-            if isinstance(payload, dict):
-                balance = payload.get("balance")
             return {
                 "simulated": False,
-                "balance": balance,
-                "raw": payload,
+                "cash": None,
+                "positions_value": payload.get("value", 0.0),
+                "position_count": payload.get("position_count", 0),
+                "positions": payload.get("positions", []),
+                "note": payload.get("note", ""),
             }
         except Exception as e:
             logger.error(f"Failed to get balance: {e}")
-            return {"simulated": False, "balance": None, "error": str(e)}
+            return {"simulated": False, "cash": None, "error": str(e)}
 
     async def get_open_orders(self) -> List[Dict[str, Any]]:
         """
